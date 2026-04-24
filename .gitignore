@@ -1,0 +1,22 @@
+# Build outputs
+*.exe
+*.dll
+*.so
+*.dylib
+bin/
+build/
+
+# Go test/build files
+*.test
+*.out
+
+# Logs
+*.log
+
+# Runtime data
+data/
+gotmp/
+
+# OS files
+.DS_Store
+Thumbs.db
