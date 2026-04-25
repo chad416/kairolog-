@@ -6,13 +6,18 @@ import (
 	"fmt"
 	"net/http"
 
-	commitlog "kairolog/internal/log"
+	"kairolog/internal/storage"
 )
 
 const defaultAddr = ":8080"
 
+type messageStore interface {
+	Append(message string) error
+	ReadAll() ([]string, error)
+}
+
 type Server struct {
-	log *commitlog.Log
+	store messageStore
 }
 
 type healthResponse struct {
@@ -31,9 +36,18 @@ type messagesResponse struct {
 	Messages []string `json:"messages"`
 }
 
-func New() *http.Server {
+func New() (*http.Server, error) {
+	store, err := storage.NewFileStore()
+	if err != nil {
+		return nil, fmt.Errorf("create file store: %w", err)
+	}
+
+	return newServer(store), nil
+}
+
+func newServer(store messageStore) *http.Server {
 	server := &Server{
-		log: commitlog.New(),
+		store: store,
 	}
 
 	mux := http.NewServeMux()
@@ -48,7 +62,10 @@ func New() *http.Server {
 }
 
 func Start() error {
-	srv := New()
+	srv, err := New()
+	if err != nil {
+		return err
+	}
 
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("start broker HTTP server: %w", err)
@@ -73,7 +90,11 @@ func (s *Server) produceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.log.Append(req.Message)
+	if err := s.store.Append(req.Message); err != nil {
+		http.Error(w, "failed to store message", http.StatusInternalServerError)
+		return
+	}
+
 	writeJSON(w, http.StatusOK, produceResponse{Status: "stored"})
 }
 
@@ -83,7 +104,13 @@ func (s *Server) messagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, messagesResponse{Messages: s.log.ReadAll()})
+	messages, err := s.store.ReadAll()
+	if err != nil {
+		http.Error(w, "failed to read messages", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, messagesResponse{Messages: messages})
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, response interface{}) {

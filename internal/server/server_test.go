@@ -4,13 +4,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"kairolog/internal/storage"
 )
 
 func TestProduceStoresMessage(t *testing.T) {
-	srv := New()
+	srv := newTestServer(t)
 
 	recorder := performRequest(t, srv.Handler, http.MethodPost, "/produce", `{"message":"hello"}`)
 
@@ -36,7 +39,7 @@ func TestProduceStoresMessage(t *testing.T) {
 }
 
 func TestMessagesReturnsStoredMessages(t *testing.T) {
-	srv := New()
+	srv := newTestServer(t)
 
 	performRequest(t, srv.Handler, http.MethodPost, "/produce", `{"message":"first"}`)
 	performRequest(t, srv.Handler, http.MethodPost, "/produce", `{"message":"second"}`)
@@ -47,6 +50,17 @@ func TestMessagesReturnsStoredMessages(t *testing.T) {
 	if !reflect.DeepEqual(messages, expected) {
 		t.Fatalf("expected %v, got %v", expected, messages)
 	}
+}
+
+func newTestServer(t *testing.T) *http.Server {
+	t.Helper()
+
+	store, err := storage.NewFileStoreAt(filepath.Join(t.TempDir(), "messages.log"))
+	if err != nil {
+		t.Fatalf("failed to create test store: %v", err)
+	}
+
+	return newServer(store)
 }
 
 func performRequest(t *testing.T, handler http.Handler, method, path, body string) *httptest.ResponseRecorder {
