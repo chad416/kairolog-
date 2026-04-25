@@ -52,6 +52,44 @@ func TestMessagesReturnsStoredMessages(t *testing.T) {
 	}
 }
 
+func TestFetchReturnsRecordsFromOffset(t *testing.T) {
+	srv := newTestServer(t)
+
+	performRequest(t, srv.Handler, http.MethodPost, "/produce", `{"message":"first"}`)
+	performRequest(t, srv.Handler, http.MethodPost, "/produce", `{"message":"second"}`)
+	performRequest(t, srv.Handler, http.MethodPost, "/produce", `{"message":"third"}`)
+
+	records := readFetchRecords(t, srv.Handler, "/fetch?offset=1")
+	expected := []fetchRecord{
+		{Offset: 1, Message: "second"},
+		{Offset: 2, Message: "third"},
+	}
+
+	if !reflect.DeepEqual(records, expected) {
+		t.Fatalf("expected %v, got %v", expected, records)
+	}
+}
+
+func TestFetchRequiresOffset(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRequest(t, srv.Handler, http.MethodGet, "/fetch", "")
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
+func TestFetchRejectsInvalidOffset(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRequest(t, srv.Handler, http.MethodGet, "/fetch?offset=invalid", "")
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
 func newTestServer(t *testing.T) *http.Server {
 	t.Helper()
 
@@ -73,6 +111,23 @@ func performRequest(t *testing.T, handler http.Handler, method, path, body strin
 	handler.ServeHTTP(recorder, req)
 
 	return recorder
+}
+
+func readFetchRecords(t *testing.T, handler http.Handler, path string) []fetchRecord {
+	t.Helper()
+
+	recorder := performRequest(t, handler, http.MethodGet, path, "")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response fetchResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	return response.Records
 }
 
 func readMessages(t *testing.T, handler http.Handler) []string {

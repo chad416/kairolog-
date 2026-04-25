@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"kairolog/internal/storage"
 )
@@ -14,6 +15,7 @@ const defaultAddr = ":8080"
 type messageStore interface {
 	Append(message string) error
 	ReadAll() ([]string, error)
+	ReadAllRecords() ([]storage.Record, error)
 }
 
 type Server struct {
@@ -36,6 +38,15 @@ type messagesResponse struct {
 	Messages []string `json:"messages"`
 }
 
+type fetchRecord struct {
+	Offset  int64  `json:"offset"`
+	Message string `json:"message"`
+}
+
+type fetchResponse struct {
+	Records []fetchRecord `json:"records"`
+}
+
 func New() (*http.Server, error) {
 	store, err := storage.NewFileStore()
 	if err != nil {
@@ -54,6 +65,7 @@ func newServer(store messageStore) *http.Server {
 	mux.HandleFunc("/health", server.healthHandler)
 	mux.HandleFunc("/produce", server.produceHandler)
 	mux.HandleFunc("/messages", server.messagesHandler)
+	mux.HandleFunc("/fetch", server.fetchHandler)
 
 	return &http.Server{
 		Addr:    defaultAddr,
@@ -111,6 +123,43 @@ func (s *Server) messagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, messagesResponse{Messages: messages})
+}
+
+func (s *Server) fetchHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	offsetValue := r.URL.Query().Get("offset")
+	if offsetValue == "" {
+		http.Error(w, "missing offset", http.StatusBadRequest)
+		return
+	}
+
+	offset, err := strconv.ParseInt(offsetValue, 10, 64)
+	if err != nil || offset < 0 {
+		http.Error(w, "invalid offset", http.StatusBadRequest)
+		return
+	}
+
+	records, err := s.store.ReadAllRecords()
+	if err != nil {
+		http.Error(w, "failed to read records", http.StatusInternalServerError)
+		return
+	}
+
+	responseRecords := make([]fetchRecord, 0, len(records))
+	for _, record := range records {
+		if record.Offset >= offset {
+			responseRecords = append(responseRecords, fetchRecord{
+				Offset:  record.Offset,
+				Message: record.Message,
+			})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, fetchResponse{Records: responseRecords})
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, response interface{}) {
