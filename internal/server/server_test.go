@@ -4,62 +4,67 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
+	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
-	"kairolog/internal/storage"
+	"kairolog/internal/topic"
 )
 
-func TestProduceStoresMessage(t *testing.T) {
+func TestHealth(t *testing.T) {
 	srv := newTestServer(t)
 
-	recorder := performRequest(t, srv.Handler, http.MethodPost, "/produce", `{"message":"hello"}`)
+	recorder := performRequest(srv.Handler, http.MethodGet, "/health", "")
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
 	}
 
-	var response produceResponse
+	var response healthResponse
 	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	if response.Status != "stored" {
-		t.Fatalf("expected status stored, got %q", response.Status)
-	}
-
-	messages := readMessages(t, srv.Handler)
-	expected := []string{"hello"}
-
-	if !reflect.DeepEqual(messages, expected) {
-		t.Fatalf("expected %v, got %v", expected, messages)
+	if response.Status != "ok" {
+		t.Fatalf("expected status ok, got %q", response.Status)
 	}
 }
 
-func TestMessagesReturnsStoredMessages(t *testing.T) {
+func TestCreateTopicAndListTopics(t *testing.T) {
 	srv := newTestServer(t)
 
-	performRequest(t, srv.Handler, http.MethodPost, "/produce", `{"message":"first"}`)
-	performRequest(t, srv.Handler, http.MethodPost, "/produce", `{"message":"second"}`)
+	recorder := createTopic(t, srv.Handler, "orders", 3)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("expected status %d, got %d", http.StatusCreated, recorder.Code)
+	}
 
-	messages := readMessages(t, srv.Handler)
-	expected := []string{"first", "second"}
+	recorder = performRequest(srv.Handler, http.MethodGet, "/topics", "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
 
-	if !reflect.DeepEqual(messages, expected) {
-		t.Fatalf("expected %v, got %v", expected, messages)
+	var response topicsResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	expected := []string{"orders"}
+	if !reflect.DeepEqual(response.Topics, expected) {
+		t.Fatalf("expected %v, got %v", expected, response.Topics)
 	}
 }
 
 func TestFetchReturnsRecordsFromOffset(t *testing.T) {
 	srv := newTestServer(t)
 
-	performRequest(t, srv.Handler, http.MethodPost, "/produce", `{"message":"first"}`)
-	performRequest(t, srv.Handler, http.MethodPost, "/produce", `{"message":"second"}`)
-	performRequest(t, srv.Handler, http.MethodPost, "/produce", `{"message":"third"}`)
+	createTopic(t, srv.Handler, "orders", 1)
+	produceMessage(t, srv.Handler, "orders", 0, "first")
+	produceMessage(t, srv.Handler, "orders", 0, "second")
+	produceMessage(t, srv.Handler, "orders", 0, "third")
 
-	records := readFetchRecords(t, srv.Handler, "/fetch?offset=1")
+	records := fetchRecords(t, srv.Handler, "/fetch?topic=orders&partition=0&offset=1")
 	expected := []fetchRecord{
 		{Offset: 1, Message: "second"},
 		{Offset: 2, Message: "third"},
@@ -70,54 +75,31 @@ func TestFetchReturnsRecordsFromOffset(t *testing.T) {
 	}
 }
 
-func TestFetchRequiresOffset(t *testing.T) {
-	srv := newTestServer(t)
-
-	recorder := performRequest(t, srv.Handler, http.MethodGet, "/fetch", "")
-
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
-	}
-}
-
-func TestFetchRejectsInvalidOffset(t *testing.T) {
-	srv := newTestServer(t)
-
-	recorder := performRequest(t, srv.Handler, http.MethodGet, "/fetch?offset=invalid", "")
-
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
-	}
-}
-
 func newTestServer(t *testing.T) *http.Server {
 	t.Helper()
+	chdirTemp(t)
 
-	store, err := storage.NewFileStoreAt(filepath.Join(t.TempDir(), "messages.log"))
-	if err != nil {
-		t.Fatalf("failed to create test store: %v", err)
-	}
-
-	return newServer(store)
+	return newServer(topic.NewManager())
 }
 
-func performRequest(t *testing.T, handler http.Handler, method, path, body string) *httptest.ResponseRecorder {
+func createTopic(t *testing.T, handler http.Handler, name string, partitions int) *httptest.ResponseRecorder {
 	t.Helper()
 
-	req := httptest.NewRequest(method, path, strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, req)
-
-	return recorder
+	body := `{"name":"` + name + `","partitions":` + strconv.Itoa(partitions) + `}`
+	return performRequest(handler, http.MethodPost, "/topics", body)
 }
 
-func readFetchRecords(t *testing.T, handler http.Handler, path string) []fetchRecord {
+func produceMessage(t *testing.T, handler http.Handler, topicName string, partition int, message string) *httptest.ResponseRecorder {
 	t.Helper()
 
-	recorder := performRequest(t, handler, http.MethodGet, path, "")
+	body := `{"topic":"` + topicName + `","partition":` + strconv.Itoa(partition) + `,"message":"` + message + `"}`
+	return performRequest(handler, http.MethodPost, "/produce", body)
+}
 
+func fetchRecords(t *testing.T, handler http.Handler, path string) []fetchRecord {
+	t.Helper()
+
+	recorder := performRequest(handler, http.MethodGet, path, "")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
 	}
@@ -130,19 +112,31 @@ func readFetchRecords(t *testing.T, handler http.Handler, path string) []fetchRe
 	return response.Records
 }
 
-func readMessages(t *testing.T, handler http.Handler) []string {
+func performRequest(handler http.Handler, method, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	return recorder
+}
+
+func chdirTemp(t *testing.T) {
 	t.Helper()
 
-	recorder := performRequest(t, handler, http.MethodGet, "/messages", "")
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
 	}
 
-	var response messagesResponse
-	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatalf("failed to change working directory: %v", err)
 	}
 
-	return response.Messages
+	t.Cleanup(func() {
+		if err := os.Chdir(originalDir); err != nil {
+			t.Fatalf("failed to restore working directory: %v", err)
+		}
+	})
 }

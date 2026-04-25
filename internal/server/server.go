@@ -6,36 +6,43 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 
 	"kairolog/internal/storage"
+	"kairolog/internal/topic"
 )
 
 const defaultAddr = ":8080"
 
-type messageStore interface {
-	Append(message string) error
-	ReadAll() ([]string, error)
-	ReadAllRecords() ([]storage.Record, error)
-}
-
 type Server struct {
-	store messageStore
+	topicManager    *topic.Manager
+	partitionStores map[string]*storage.FileStore
+	storeMu         sync.Mutex
 }
 
 type healthResponse struct {
 	Status string `json:"status"`
 }
 
+type createTopicRequest struct {
+	Name       string `json:"name"`
+	Partitions int    `json:"partitions"`
+}
+
+type topicsResponse struct {
+	Topics []string `json:"topics"`
+}
+
 type produceRequest struct {
-	Message string `json:"message"`
+	Topic     string `json:"topic"`
+	Partition int    `json:"partition"`
+	Message   string `json:"message"`
 }
 
 type produceResponse struct {
 	Status string `json:"status"`
-}
-
-type messagesResponse struct {
-	Messages []string `json:"messages"`
+	Offset int64  `json:"offset"`
 }
 
 type fetchRecord struct {
@@ -48,23 +55,19 @@ type fetchResponse struct {
 }
 
 func New() (*http.Server, error) {
-	store, err := storage.NewFileStore()
-	if err != nil {
-		return nil, fmt.Errorf("create file store: %w", err)
-	}
-
-	return newServer(store), nil
+	return newServer(topic.NewManager()), nil
 }
 
-func newServer(store messageStore) *http.Server {
+func newServer(topicManager *topic.Manager) *http.Server {
 	server := &Server{
-		store: store,
+		topicManager:    topicManager,
+		partitionStores: make(map[string]*storage.FileStore),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", server.healthHandler)
+	mux.HandleFunc("/topics", server.topicsHandler)
 	mux.HandleFunc("/produce", server.produceHandler)
-	mux.HandleFunc("/messages", server.messagesHandler)
 	mux.HandleFunc("/fetch", server.fetchHandler)
 
 	return &http.Server{
@@ -87,7 +90,58 @@ func Start() error {
 }
 
 func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	writeJSON(w, http.StatusOK, healthResponse{Status: "ok"})
+}
+
+func (s *Server) topicsHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		s.createTopicHandler(w, r)
+	case http.MethodGet:
+		s.listTopicsHandler(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) createTopicHandler(w http.ResponseWriter, r *http.Request) {
+	var req createTopicRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" || req.Partitions <= 0 {
+		http.Error(w, "invalid topic request", http.StatusBadRequest)
+		return
+	}
+
+	if _, exists := s.topicManager.GetTopic(name); exists {
+		http.Error(w, "topic already exists", http.StatusConflict)
+		return
+	}
+
+	if err := s.topicManager.CreateTopic(name, req.Partitions); err != nil {
+		if _, exists := s.topicManager.GetTopic(name); exists {
+			http.Error(w, "topic already exists", http.StatusConflict)
+			return
+		}
+
+		http.Error(w, "failed to create topic", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+}
+
+func (s *Server) listTopicsHandler(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, topicsResponse{Topics: s.topicManager.ListTopics()})
 }
 
 func (s *Server) produceHandler(w http.ResponseWriter, r *http.Request) {
@@ -102,32 +156,57 @@ func (s *Server) produceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.Append(req.Message); err != nil {
+	topicName := strings.TrimSpace(req.Topic)
+	if topicName == "" || req.Partition < 0 {
+		http.Error(w, "invalid produce request", http.StatusBadRequest)
+		return
+	}
+
+	partition, ok := s.getPartition(topicName, req.Partition)
+	if !ok {
+		http.Error(w, "topic or partition not found", http.StatusNotFound)
+		return
+	}
+
+	store, err := s.partitionStore(partition.StoragePath)
+	if err != nil {
+		http.Error(w, "failed to open partition storage", http.StatusInternalServerError)
+		return
+	}
+
+	offset, err := store.AppendRecord(req.Message)
+	if err != nil {
 		http.Error(w, "failed to store message", http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, produceResponse{Status: "stored"})
-}
-
-func (s *Server) messagesHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	messages, err := s.store.ReadAll()
-	if err != nil {
-		http.Error(w, "failed to read messages", http.StatusInternalServerError)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, messagesResponse{Messages: messages})
+	writeJSON(w, http.StatusOK, produceResponse{
+		Status: "stored",
+		Offset: offset,
+	})
 }
 
 func (s *Server) fetchHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	topicName := strings.TrimSpace(r.URL.Query().Get("topic"))
+	if topicName == "" {
+		http.Error(w, "missing topic", http.StatusBadRequest)
+		return
+	}
+
+	partitionValue := r.URL.Query().Get("partition")
+	if partitionValue == "" {
+		http.Error(w, "missing partition", http.StatusBadRequest)
+		return
+	}
+
+	partitionID, err := strconv.Atoi(partitionValue)
+	if err != nil || partitionID < 0 {
+		http.Error(w, "invalid partition", http.StatusBadRequest)
 		return
 	}
 
@@ -143,7 +222,19 @@ func (s *Server) fetchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	records, err := s.store.ReadAllRecords()
+	partition, ok := s.getPartition(topicName, partitionID)
+	if !ok {
+		http.Error(w, "topic or partition not found", http.StatusNotFound)
+		return
+	}
+
+	store, err := s.partitionStore(partition.StoragePath)
+	if err != nil {
+		http.Error(w, "failed to open partition storage", http.StatusInternalServerError)
+		return
+	}
+
+	records, err := store.ReadAllRecords()
 	if err != nil {
 		http.Error(w, "failed to read records", http.StatusInternalServerError)
 		return
@@ -160,6 +251,39 @@ func (s *Server) fetchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, fetchResponse{Records: responseRecords})
+}
+
+func (s *Server) getPartition(topicName string, partitionID int) (topic.Partition, bool) {
+	topicInfo, exists := s.topicManager.GetTopic(topicName)
+	if !exists {
+		return topic.Partition{}, false
+	}
+
+	for _, partition := range topicInfo.Partitions {
+		if partition.ID == partitionID {
+			return partition, true
+		}
+	}
+
+	return topic.Partition{}, false
+}
+
+func (s *Server) partitionStore(path string) (*storage.FileStore, error) {
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
+
+	store, exists := s.partitionStores[path]
+	if exists {
+		return store, nil
+	}
+
+	store, err := storage.NewFileStoreAt(path)
+	if err != nil {
+		return nil, err
+	}
+
+	s.partitionStores[path] = store
+	return store, nil
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, response interface{}) {
