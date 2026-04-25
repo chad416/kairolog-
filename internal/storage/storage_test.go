@@ -67,6 +67,74 @@ func TestMultipleAppends(t *testing.T) {
 	}
 }
 
+func TestAppendRecordReturnsOffsets(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	firstOffset, err := store.AppendRecord("first")
+	if err != nil {
+		t.Fatalf("failed to append first record: %v", err)
+	}
+
+	secondOffset, err := store.AppendRecord("second")
+	if err != nil {
+		t.Fatalf("failed to append second record: %v", err)
+	}
+
+	if firstOffset != 0 {
+		t.Fatalf("expected first offset 0, got %d", firstOffset)
+	}
+	if secondOffset != 1 {
+		t.Fatalf("expected second offset 1, got %d", secondOffset)
+	}
+}
+
+func TestReadAllRecordsReturnsStoredRecords(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	if err := store.Append("first"); err != nil {
+		t.Fatalf("failed to append first message: %v", err)
+	}
+	if err := store.Append("second"); err != nil {
+		t.Fatalf("failed to append second message: %v", err)
+	}
+
+	records, err := store.ReadAllRecords()
+	if err != nil {
+		t.Fatalf("failed to read records: %v", err)
+	}
+
+	expected := []Record{
+		{Offset: 0, Message: "first"},
+		{Offset: 1, Message: "second"},
+	}
+
+	if !reflect.DeepEqual(records, expected) {
+		t.Fatalf("expected %v, got %v", expected, records)
+	}
+}
+
+func TestNextOffsetIsRecoveredFromFile(t *testing.T) {
+	store, path := newTestStore(t)
+
+	if err := store.Append("existing"); err != nil {
+		t.Fatalf("failed to append existing message: %v", err)
+	}
+
+	restartedStore, err := NewFileStoreAt(path)
+	if err != nil {
+		t.Fatalf("failed to restart file store: %v", err)
+	}
+
+	offset, err := restartedStore.AppendRecord("new")
+	if err != nil {
+		t.Fatalf("failed to append new record: %v", err)
+	}
+
+	if offset != 1 {
+		t.Fatalf("expected recovered offset 1, got %d", offset)
+	}
+}
+
 func TestFileIsCreatedAutomatically(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data", "messages.log")
 
