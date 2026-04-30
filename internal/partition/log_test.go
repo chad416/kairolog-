@@ -29,7 +29,7 @@ func TestNewLogCreatesSegmentAndIndex(t *testing.T) {
 }
 
 func TestAppendReturnsOffsetsAndWritesRealBytePositionIndexEntries(t *testing.T) {
-	log, err := NewLog(t.TempDir())
+	log, err := NewLogWithMaxSegmentSize(t.TempDir(), 1024)
 	if err != nil {
 		t.Fatalf("failed to create partition log: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestAppendReturnsOffsetsAndWritesRealBytePositionIndexEntries(t *testing.T)
 		t.Fatalf("expected second offset 1, got %d", secondOffset)
 	}
 
-	entries, err := log.index.ReadAll()
+	entries, err := log.segments[0].index.ReadAll()
 	if err != nil {
 		t.Fatalf("failed to read index entries: %v", err)
 	}
@@ -59,7 +59,6 @@ func TestAppendReturnsOffsetsAndWritesRealBytePositionIndexEntries(t *testing.T)
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 index entries, got %d", len(entries))
 	}
-
 	if entries[0].Offset != 0 || entries[0].Position != 0 {
 		t.Fatalf("expected first index entry offset 0 position 0, got %+v", entries[0])
 	}
@@ -71,17 +70,12 @@ func TestAppendReturnsOffsetsAndWritesRealBytePositionIndexEntries(t *testing.T)
 }
 
 func TestReadAllReturnsAllRecords(t *testing.T) {
-	log, err := NewLog(t.TempDir())
+	log, err := NewLogWithMaxSegmentSize(t.TempDir(), 1024)
 	if err != nil {
 		t.Fatalf("failed to create partition log: %v", err)
 	}
 
-	if _, err := log.Append("first"); err != nil {
-		t.Fatalf("failed to append first record: %v", err)
-	}
-	if _, err := log.Append("second"); err != nil {
-		t.Fatalf("failed to append second record: %v", err)
-	}
+	appendMessages(t, log, "first", "second")
 
 	records, err := log.ReadAll()
 	if err != nil {
@@ -99,20 +93,12 @@ func TestReadAllReturnsAllRecords(t *testing.T) {
 }
 
 func TestReadFromReturnsRecordsAtOrAfterOffset(t *testing.T) {
-	log, err := NewLog(t.TempDir())
+	log, err := NewLogWithMaxSegmentSize(t.TempDir(), 1024)
 	if err != nil {
 		t.Fatalf("failed to create partition log: %v", err)
 	}
 
-	if _, err := log.Append("first"); err != nil {
-		t.Fatalf("failed to append first record: %v", err)
-	}
-	if _, err := log.Append("second"); err != nil {
-		t.Fatalf("failed to append second record: %v", err)
-	}
-	if _, err := log.Append("third"); err != nil {
-		t.Fatalf("failed to append third record: %v", err)
-	}
+	appendMessages(t, log, "first", "second", "third")
 
 	records, err := log.ReadFrom(1)
 	if err != nil {
@@ -143,19 +129,14 @@ func TestReadFromRejectsNegativeOffset(t *testing.T) {
 func TestLogRecoversRecordsOnReopen(t *testing.T) {
 	dir := t.TempDir()
 
-	log, err := NewLog(dir)
+	log, err := NewLogWithMaxSegmentSize(dir, 1024)
 	if err != nil {
 		t.Fatalf("failed to create partition log: %v", err)
 	}
 
-	if _, err := log.Append("first"); err != nil {
-		t.Fatalf("failed to append first record: %v", err)
-	}
-	if _, err := log.Append("second"); err != nil {
-		t.Fatalf("failed to append second record: %v", err)
-	}
+	appendMessages(t, log, "first", "second")
 
-	reopenedLog, err := NewLog(dir)
+	reopenedLog, err := NewLogWithMaxSegmentSize(dir, 1024)
 	if err != nil {
 		t.Fatalf("failed to reopen partition log: %v", err)
 	}
@@ -211,8 +192,11 @@ func TestReadFromUsesIndexBackedPositionedReads(t *testing.T) {
 	}
 
 	log := &Log{
-		segment: segment,
-		index:   index,
+		dir:            dir,
+		maxSegmentSize: 1024,
+		segments: []segmentPair{
+			{segment: segment, index: index},
+		},
 	}
 
 	records, err := log.ReadFrom(10)
@@ -227,4 +211,166 @@ func TestReadFromUsesIndexBackedPositionedReads(t *testing.T) {
 	if !reflect.DeepEqual(records, expected) {
 		t.Fatalf("expected %v, got %v", expected, records)
 	}
+}
+
+func TestSegmentRotationCreatesMultipleSegmentAndIndexFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	log, err := NewLogWithMaxSegmentSize(dir, int64(len("aaa\n")))
+	if err != nil {
+		t.Fatalf("failed to create partition log: %v", err)
+	}
+
+	appendMessages(t, log, "aaa", "bbb")
+
+	if countFilesWithSuffix(t, dir, ".log") != 2 {
+		t.Fatalf("expected 2 segment files")
+	}
+	if countFilesWithSuffix(t, dir, ".index") != 2 {
+		t.Fatalf("expected 2 index files")
+	}
+}
+
+func TestOffsetsContinueAcrossRotatedSegments(t *testing.T) {
+	log, err := NewLogWithMaxSegmentSize(t.TempDir(), int64(len("aaa\n")))
+	if err != nil {
+		t.Fatalf("failed to create partition log: %v", err)
+	}
+
+	firstOffset, err := log.Append("aaa")
+	if err != nil {
+		t.Fatalf("failed to append first record: %v", err)
+	}
+
+	secondOffset, err := log.Append("bbb")
+	if err != nil {
+		t.Fatalf("failed to append second record: %v", err)
+	}
+
+	thirdOffset, err := log.Append("ccc")
+	if err != nil {
+		t.Fatalf("failed to append third record: %v", err)
+	}
+
+	expected := []int64{0, 1, 2}
+	actual := []int64{firstOffset, secondOffset, thirdOffset}
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("expected offsets %v, got %v", expected, actual)
+	}
+}
+
+func TestReadAllReadsAcrossSegments(t *testing.T) {
+	log, err := NewLogWithMaxSegmentSize(t.TempDir(), int64(len("aaa\n")))
+	if err != nil {
+		t.Fatalf("failed to create partition log: %v", err)
+	}
+
+	appendMessages(t, log, "aaa", "bbb", "ccc")
+
+	records, err := log.ReadAll()
+	if err != nil {
+		t.Fatalf("failed to read records: %v", err)
+	}
+
+	expected := []Record{
+		{Offset: 0, Message: "aaa"},
+		{Offset: 1, Message: "bbb"},
+		{Offset: 2, Message: "ccc"},
+	}
+
+	if !reflect.DeepEqual(records, expected) {
+		t.Fatalf("expected %v, got %v", expected, records)
+	}
+}
+
+func TestReadFromReadsAcrossSegments(t *testing.T) {
+	log, err := NewLogWithMaxSegmentSize(t.TempDir(), int64(len("aaa\n")+len("bbb\n")))
+	if err != nil {
+		t.Fatalf("failed to create partition log: %v", err)
+	}
+
+	appendMessages(t, log, "aaa", "bbb", "ccc")
+
+	records, err := log.ReadFrom(1)
+	if err != nil {
+		t.Fatalf("failed to read records from offset: %v", err)
+	}
+
+	expected := []Record{
+		{Offset: 1, Message: "bbb"},
+		{Offset: 2, Message: "ccc"},
+	}
+
+	if !reflect.DeepEqual(records, expected) {
+		t.Fatalf("expected %v, got %v", expected, records)
+	}
+}
+
+func TestReopeningRecoversRotatedSegmentsAndContinuesAtCorrectOffset(t *testing.T) {
+	dir := t.TempDir()
+	maxSegmentSize := int64(len("aaa\n") + len("bbb\n"))
+
+	log, err := NewLogWithMaxSegmentSize(dir, maxSegmentSize)
+	if err != nil {
+		t.Fatalf("failed to create partition log: %v", err)
+	}
+
+	appendMessages(t, log, "aaa", "bbb", "ccc")
+
+	reopenedLog, err := NewLogWithMaxSegmentSize(dir, maxSegmentSize)
+	if err != nil {
+		t.Fatalf("failed to reopen partition log: %v", err)
+	}
+
+	offset, err := reopenedLog.Append("ddd")
+	if err != nil {
+		t.Fatalf("failed to append after reopen: %v", err)
+	}
+	if offset != 3 {
+		t.Fatalf("expected offset 3 after reopen, got %d", offset)
+	}
+
+	records, err := reopenedLog.ReadAll()
+	if err != nil {
+		t.Fatalf("failed to read records: %v", err)
+	}
+
+	expected := []Record{
+		{Offset: 0, Message: "aaa"},
+		{Offset: 1, Message: "bbb"},
+		{Offset: 2, Message: "ccc"},
+		{Offset: 3, Message: "ddd"},
+	}
+
+	if !reflect.DeepEqual(records, expected) {
+		t.Fatalf("expected %v, got %v", expected, records)
+	}
+}
+
+func appendMessages(t *testing.T, log *Log, messages ...string) {
+	t.Helper()
+
+	for _, message := range messages {
+		if _, err := log.Append(message); err != nil {
+			t.Fatalf("failed to append message %q: %v", message, err)
+		}
+	}
+}
+
+func countFilesWithSuffix(t *testing.T, dir string, suffix string) int {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("failed to read dir: %v", err)
+	}
+
+	count := 0
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) == suffix {
+			count++
+		}
+	}
+
+	return count
 }
