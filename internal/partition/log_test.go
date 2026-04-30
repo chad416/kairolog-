@@ -347,6 +347,170 @@ func TestReopeningRecoversRotatedSegmentsAndContinuesAtCorrectOffset(t *testing.
 	}
 }
 
+func TestMissingIndexIsRebuiltOnReopen(t *testing.T) {
+	dir := t.TempDir()
+
+	log, err := NewLogWithMaxSegmentSize(dir, 1024)
+	if err != nil {
+		t.Fatalf("failed to create partition log: %v", err)
+	}
+
+	appendMessages(t, log, "first", "second")
+	removeIndexFile(t, dir, 0)
+
+	if _, err := NewLogWithMaxSegmentSize(dir, 1024); err != nil {
+		t.Fatalf("failed to reopen partition log: %v", err)
+	}
+
+	indexPath := filepath.Join(dir, "00000000000000000000.index")
+	if _, err := os.Stat(indexPath); err != nil {
+		t.Fatalf("expected rebuilt index file to exist: %v", err)
+	}
+}
+
+func TestRebuiltIndexContainsRealBytePositions(t *testing.T) {
+	dir := t.TempDir()
+
+	log, err := NewLogWithMaxSegmentSize(dir, 1024)
+	if err != nil {
+		t.Fatalf("failed to create partition log: %v", err)
+	}
+
+	appendMessages(t, log, "a", "bbb", "cc")
+	removeIndexFile(t, dir, 0)
+
+	if _, err := NewLogWithMaxSegmentSize(dir, 1024); err != nil {
+		t.Fatalf("failed to reopen partition log: %v", err)
+	}
+
+	entries := readIndexEntries(t, dir, 0)
+	expected := []indexpkg.Entry{
+		{Offset: 0, Position: 0},
+		{Offset: 1, Position: int64(len("a\n"))},
+		{Offset: 2, Position: int64(len("a\n") + len("bbb\n"))},
+	}
+
+	if !reflect.DeepEqual(entries, expected) {
+		t.Fatalf("expected %v, got %v", expected, entries)
+	}
+}
+
+func TestReadFromWorksAfterIndexRebuild(t *testing.T) {
+	dir := t.TempDir()
+
+	log, err := NewLogWithMaxSegmentSize(dir, 1024)
+	if err != nil {
+		t.Fatalf("failed to create partition log: %v", err)
+	}
+
+	appendMessages(t, log, "first", "second", "third")
+	removeIndexFile(t, dir, 0)
+
+	recoveredLog, err := NewLogWithMaxSegmentSize(dir, 1024)
+	if err != nil {
+		t.Fatalf("failed to reopen partition log: %v", err)
+	}
+
+	records, err := recoveredLog.ReadFrom(1)
+	if err != nil {
+		t.Fatalf("failed to read records after index rebuild: %v", err)
+	}
+
+	expected := []Record{
+		{Offset: 1, Message: "second"},
+		{Offset: 2, Message: "third"},
+	}
+
+	if !reflect.DeepEqual(records, expected) {
+		t.Fatalf("expected %v, got %v", expected, records)
+	}
+}
+
+func TestAppendAfterIndexRebuildContinuesAtCorrectOffset(t *testing.T) {
+	dir := t.TempDir()
+
+	log, err := NewLogWithMaxSegmentSize(dir, 1024)
+	if err != nil {
+		t.Fatalf("failed to create partition log: %v", err)
+	}
+
+	appendMessages(t, log, "first", "second")
+	removeIndexFile(t, dir, 0)
+
+	recoveredLog, err := NewLogWithMaxSegmentSize(dir, 1024)
+	if err != nil {
+		t.Fatalf("failed to reopen partition log: %v", err)
+	}
+
+	offset, err := recoveredLog.Append("third")
+	if err != nil {
+		t.Fatalf("failed to append after index rebuild: %v", err)
+	}
+	if offset != 2 {
+		t.Fatalf("expected offset 2 after index rebuild, got %d", offset)
+	}
+
+	records, err := recoveredLog.ReadAll()
+	if err != nil {
+		t.Fatalf("failed to read records: %v", err)
+	}
+
+	expected := []Record{
+		{Offset: 0, Message: "first"},
+		{Offset: 1, Message: "second"},
+		{Offset: 2, Message: "third"},
+	}
+
+	if !reflect.DeepEqual(records, expected) {
+		t.Fatalf("expected %v, got %v", expected, records)
+	}
+}
+
+func TestMultipleRotatedSegmentsRecoverMissingIndexes(t *testing.T) {
+	dir := t.TempDir()
+	maxSegmentSize := int64(len("aaa\n"))
+
+	log, err := NewLogWithMaxSegmentSize(dir, maxSegmentSize)
+	if err != nil {
+		t.Fatalf("failed to create partition log: %v", err)
+	}
+
+	appendMessages(t, log, "aaa", "bbb", "ccc")
+	removeIndexFile(t, dir, 0)
+	removeIndexFile(t, dir, 2)
+
+	recoveredLog, err := NewLogWithMaxSegmentSize(dir, maxSegmentSize)
+	if err != nil {
+		t.Fatalf("failed to reopen partition log: %v", err)
+	}
+
+	if countFilesWithSuffix(t, dir, ".index") != 3 {
+		t.Fatalf("expected 3 index files after recovery")
+	}
+
+	records, err := recoveredLog.ReadFrom(1)
+	if err != nil {
+		t.Fatalf("failed to read records after recovery: %v", err)
+	}
+
+	expected := []Record{
+		{Offset: 1, Message: "bbb"},
+		{Offset: 2, Message: "ccc"},
+	}
+
+	if !reflect.DeepEqual(records, expected) {
+		t.Fatalf("expected %v, got %v", expected, records)
+	}
+
+	offset, err := recoveredLog.Append("ddd")
+	if err != nil {
+		t.Fatalf("failed to append after recovery: %v", err)
+	}
+	if offset != 3 {
+		t.Fatalf("expected offset 3 after recovery, got %d", offset)
+	}
+}
+
 func appendMessages(t *testing.T, log *Log, messages ...string) {
 	t.Helper()
 
@@ -373,4 +537,29 @@ func countFilesWithSuffix(t *testing.T, dir string, suffix string) int {
 	}
 
 	return count
+}
+
+func removeIndexFile(t *testing.T, dir string, baseOffset int64) {
+	t.Helper()
+
+	indexPath := filepath.Join(dir, segmentFileName(baseOffset, ".index"))
+	if err := os.Remove(indexPath); err != nil {
+		t.Fatalf("failed to remove index file %q: %v", indexPath, err)
+	}
+}
+
+func readIndexEntries(t *testing.T, dir string, baseOffset int64) []indexpkg.Entry {
+	t.Helper()
+
+	idx, err := indexpkg.NewIndex(dir, baseOffset)
+	if err != nil {
+		t.Fatalf("failed to open index: %v", err)
+	}
+
+	entries, err := idx.ReadAll()
+	if err != nil {
+		t.Fatalf("failed to read index entries: %v", err)
+	}
+
+	return entries
 }

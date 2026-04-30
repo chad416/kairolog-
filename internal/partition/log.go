@@ -1,7 +1,9 @@
 package partition
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -216,15 +218,6 @@ func loadSegmentPairs(dir string) ([]segmentPair, error) {
 			continue
 		}
 
-		indexPath := filepath.Join(dir, segmentFileName(baseOffset, ".index"))
-		if _, err := os.Stat(indexPath); err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-
-			return nil, fmt.Errorf("stat index file %q: %w", indexPath, err)
-		}
-
 		baseOffsets = append(baseOffsets, baseOffset)
 	}
 
@@ -234,6 +227,10 @@ func loadSegmentPairs(dir string) ([]segmentPair, error) {
 
 	segments := make([]segmentPair, 0, len(baseOffsets))
 	for _, baseOffset := range baseOffsets {
+		if err := ensureIndexForSegment(dir, baseOffset); err != nil {
+			return nil, err
+		}
+
 		pair, err := newSegmentPair(dir, baseOffset)
 		if err != nil {
 			return nil, err
@@ -243,6 +240,61 @@ func loadSegmentPairs(dir string) ([]segmentPair, error) {
 	}
 
 	return segments, nil
+}
+
+func ensureIndexForSegment(dir string, baseOffset int64) error {
+	indexPath := filepath.Join(dir, segmentFileName(baseOffset, ".index"))
+	if _, err := os.Stat(indexPath); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat index file %q: %w", indexPath, err)
+	}
+
+	if err := rebuildIndexFromSegmentFile(dir, baseOffset); err != nil {
+		return fmt.Errorf("rebuild index %d: %w", baseOffset, err)
+	}
+
+	return nil
+}
+
+func rebuildIndexFromSegmentFile(dir string, baseOffset int64) error {
+	segmentPath := filepath.Join(dir, segmentFileName(baseOffset, ".log"))
+	file, err := os.Open(segmentPath)
+	if err != nil {
+		return fmt.Errorf("open segment for index rebuild: %w", err)
+	}
+	defer file.Close()
+
+	idx, err := index.NewIndex(dir, baseOffset)
+	if err != nil {
+		return fmt.Errorf("create rebuilt index: %w", err)
+	}
+
+	reader := bufio.NewReader(file)
+	offset := baseOffset
+	position := int64(0)
+
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			if err := idx.Append(offset, position); err != nil {
+				return fmt.Errorf("append rebuilt index entry: %w", err)
+			}
+
+			position += int64(len(line))
+			offset++
+		}
+
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+
+			return fmt.Errorf("read segment for index rebuild: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func newSegmentPair(dir string, baseOffset int64) (segmentPair, error) {
