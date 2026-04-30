@@ -59,8 +59,10 @@ func TestAppendReturnsOffsetsAndWritesIndexEntries(t *testing.T) {
 	if entries[0].Offset != 0 || entries[0].Position != 0 {
 		t.Fatalf("expected first index entry offset 0 position 0, got %+v", entries[0])
 	}
-	if entries[1].Offset != 1 || entries[1].Position != 1 {
-		t.Fatalf("expected second index entry offset 1 position 1, got %+v", entries[1])
+
+	expectedSecondPosition := int64(len("first\n"))
+	if entries[1].Offset != 1 || entries[1].Position != expectedSecondPosition {
+		t.Fatalf("expected second index entry offset 1 position %d, got %+v", expectedSecondPosition, entries[1])
 	}
 }
 

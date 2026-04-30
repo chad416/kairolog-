@@ -49,8 +49,13 @@ func NewSegment(dir string, baseOffset int64) (*Segment, error) {
 }
 
 func (s *Segment) Append(message string) (int64, error) {
+	offset, _, err := s.AppendWithPosition(message)
+	return offset, err
+}
+
+func (s *Segment) AppendWithPosition(message string) (int64, int64, error) {
 	if strings.ContainsAny(message, "\r\n") {
-		return 0, fmt.Errorf("message cannot contain newline characters")
+		return 0, 0, fmt.Errorf("message cannot contain newline characters")
 	}
 
 	s.mu.Lock()
@@ -58,21 +63,28 @@ func (s *Segment) Append(message string) (int64, error) {
 
 	file, err := os.OpenFile(s.path, os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		return 0, fmt.Errorf("open segment for append: %w", err)
+		return 0, 0, fmt.Errorf("open segment for append: %w", err)
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return 0, 0, fmt.Errorf("stat segment before append: %w", err)
 	}
 
 	offset := s.nextOffset
+	position := info.Size()
 	if _, err := fmt.Fprintln(file, message); err != nil {
 		_ = file.Close()
-		return 0, fmt.Errorf("append record: %w", err)
+		return 0, 0, fmt.Errorf("append record: %w", err)
 	}
 
 	if err := file.Close(); err != nil {
-		return 0, fmt.Errorf("close segment after append: %w", err)
+		return 0, 0, fmt.Errorf("close segment after append: %w", err)
 	}
 
 	s.nextOffset++
-	return offset, nil
+	return offset, position, nil
 }
 
 func (s *Segment) ReadAll() ([]Record, error) {

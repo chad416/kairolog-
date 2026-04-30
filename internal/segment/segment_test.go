@@ -52,6 +52,38 @@ func TestSegmentOffsetsStartAtBaseOffset(t *testing.T) {
 	}
 }
 
+func TestAppendWithPositionReturnsBytePositions(t *testing.T) {
+	segment, err := NewSegment(t.TempDir(), 10)
+	if err != nil {
+		t.Fatalf("failed to create segment: %v", err)
+	}
+
+	firstOffset, firstPosition, err := segment.AppendWithPosition("first")
+	if err != nil {
+		t.Fatalf("failed to append first record: %v", err)
+	}
+
+	secondOffset, secondPosition, err := segment.AppendWithPosition("second")
+	if err != nil {
+		t.Fatalf("failed to append second record: %v", err)
+	}
+
+	if firstOffset != 10 {
+		t.Fatalf("expected first offset 10, got %d", firstOffset)
+	}
+	if firstPosition != 0 {
+		t.Fatalf("expected first position 0, got %d", firstPosition)
+	}
+	if secondOffset != 11 {
+		t.Fatalf("expected second offset 11, got %d", secondOffset)
+	}
+
+	expectedSecondPosition := int64(len("first\n"))
+	if secondPosition != expectedSecondPosition {
+		t.Fatalf("expected second position %d, got %d", expectedSecondPosition, secondPosition)
+	}
+}
+
 func TestReadAllReturnsRecords(t *testing.T) {
 	segment, err := NewSegment(t.TempDir(), 5)
 	if err != nil {

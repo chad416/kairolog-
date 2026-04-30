@@ -40,12 +40,11 @@ func (l *Log) Append(message string) (int64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	offset, err := l.segment.Append(message)
+	offset, position, err := l.segment.AppendWithPosition(message)
 	if err != nil {
 		return 0, fmt.Errorf("append to segment: %w", err)
 	}
 
-	position := offset - l.segment.BaseOffset()
 	if err := l.index.Append(offset, position); err != nil {
 		return 0, fmt.Errorf("append to index: %w", err)
 	}
