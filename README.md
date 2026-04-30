@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, and consumer group assignment.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, and consumer group membership.
 
 ## Current Features
 
@@ -15,6 +15,9 @@ The current focus is the single-node broker and storage foundation: topics, part
 - Consumer offset commit endpoint (`POST /offsets/commit`)
 - Consumer offset lookup endpoint (`GET /offsets`)
 - Consumer group assignment endpoint (`POST /groups/assign`)
+- Consumer group join endpoint (`POST /groups/join`)
+- Consumer group leave endpoint (`POST /groups/leave`)
+- Consumer group members endpoint (`GET /groups/members`)
 - In-memory log component
 - File-based storage component
 - Offset-aware records
@@ -32,6 +35,8 @@ The current focus is the single-node broker and storage foundation: topics, part
 - Persistent consumer offset commits
 - Consumer group assignment engine
 - Deterministic balanced partition assignment
+- Consumer group membership registry
+- Join/leave group membership lifecycle
 - Topic manager
 - Partition manager
 - Topic partitions wired to partition logs
@@ -49,6 +54,7 @@ server
 → index files
 → consumer offset store
 → group assignment engine
+→ group membership registry
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -62,6 +68,8 @@ If an index file is missing during partition-log startup, KairoLog can rebuild i
 Consumer offsets are stored separately so a consumer group can remember how far it has processed a topic partition.
 
 The group assignment engine distributes topic partitions across consumer group members in a deterministic and balanced way. The HTTP broker exposes this through `POST /groups/assign`.
+
+The group membership registry tracks members joining and leaving consumer groups. The HTTP broker exposes this through `POST /groups/join`, `POST /groups/leave`, and `GET /groups/members`.
 
 ## Storage Layout
 
@@ -85,6 +93,8 @@ Segment files store records.
 Index files store offset-to-byte-position mappings.
 
 The consumer offset file stores committed offsets for consumer groups.
+
+Current group membership is in-memory only and is not persisted yet.
 
 ## API
 
@@ -279,6 +289,74 @@ Example response:
 }
 ```
 
+### Join Consumer Group
+
+```http
+POST /groups/join
+```
+
+Example request:
+
+```json
+{
+  "group": "analytics-workers",
+  "member_id": "member-a"
+}
+```
+
+Example response:
+
+```json
+{
+  "status": "joined"
+}
+```
+
+### Leave Consumer Group
+
+```http
+POST /groups/leave
+```
+
+Example request:
+
+```json
+{
+  "group": "analytics-workers",
+  "member_id": "member-a"
+}
+```
+
+Example response:
+
+```json
+{
+  "status": "left"
+}
+```
+
+### List Consumer Group Members
+
+```http
+GET /groups/members?group=analytics-workers
+```
+
+Example response:
+
+```json
+{
+  "group": "analytics-workers",
+  "members": [
+    {
+      "id": "member-a"
+    },
+    {
+      "id": "member-b"
+    }
+  ]
+}
+```
+
 ## Consumer Group Assignment
 
 The group assignment engine distributes partitions across members.
@@ -299,6 +377,29 @@ member-b → partitions 2, 3
 ```
 
 The assignment is deterministic because members are sorted by ID before partitions are assigned.
+
+## Consumer Group Membership
+
+The group membership registry tracks active members for each group.
+
+Example:
+
+```text
+group: analytics-workers
+members: member-a, member-b
+```
+
+Supported behavior:
+
+```text
+member joins group
+member leaves group
+current members can be listed
+duplicate joins are idempotent
+leaving a missing member is idempotent
+```
+
+Membership is currently in-memory only. It is not persisted and does not include heartbeats or automatic rebalancing yet.
 
 ## Running Tests
 
@@ -332,11 +433,13 @@ Completed core areas:
 - Consumer offset commit and lookup endpoints
 - Consumer group assignment engine
 - Consumer group assignment endpoint
+- Consumer group membership registry
+- Consumer group membership endpoints
 
 Still planned:
 
 - Stronger crash recovery beyond missing-index rebuild
-- Consumer group membership lifecycle
+- Persistent group membership
 - Heartbeats and real rebalancing behavior
 - CLI client
 - Docker Compose demo
