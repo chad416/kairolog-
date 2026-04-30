@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node storage and broker foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, and basic crash recovery.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, and consumer offset commits.
 
 ## Current Features
 
@@ -12,6 +12,8 @@ The current focus is the single-node storage and broker foundation: topics, part
 - Topic listing endpoint (`GET /topics`)
 - Topic-aware produce endpoint (`POST /produce`)
 - Topic/partition-aware fetch endpoint (`GET /fetch`)
+- Consumer offset commit endpoint (`POST /offsets/commit`)
+- Consumer offset lookup endpoint (`GET /offsets`)
 - In-memory log component
 - File-based storage component
 - Offset-aware records
@@ -21,15 +23,16 @@ The current focus is the single-node storage and broker foundation: topics, part
 - Partition log abstraction
 - Basic segment rotation
 - Multiple segment/index pairs per partition
-- Reopen support for existing rotated segments
+- Reopen support for rotated segment/index pairs
 - Basic crash recovery for partition logs
 - Missing index-file rebuild from existing segment logs
 - Recovery of offset-to-byte-position mappings
-- Reopen support for rotated segment/index pairs
+- Consumer offset store
+- Persistent consumer offset commits
 - Topic manager
 - Partition manager
 - Topic partitions wired to partition logs
-- Unit tests for log, storage, topic, server, segment, index, and partition packages
+- Unit tests for log, storage, topic, server, segment, index, partition, and consumer packages
 
 ## Current Architecture
 
@@ -41,15 +44,18 @@ server
 → partition log
 → segment files
 → index files
+→ consumer offset store
 ```
 
-Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
+Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
 
 Reads can use the index to seek into the segment instead of scanning from the beginning.
 
 Segment rotation creates new segment/index pairs when the active segment reaches the configured size limit.
 
 If an index file is missing during partition-log startup, KairoLog can rebuild it by scanning the matching segment log file and restoring offset-to-byte-position mappings.
+
+Consumer offsets are stored separately so a consumer group can remember how far it has processed a topic partition.
 
 ## Storage Layout
 
@@ -59,6 +65,7 @@ Example:
 
 ```text
 data/
+├── consumer_offsets.log
 └── orders/
     └── partition-0/
         ├── 00000000000000000000.log
@@ -70,6 +77,8 @@ data/
 Segment files store records.
 
 Index files store offset-to-byte-position mappings.
+
+The consumer offset file stores committed offsets for consumer groups.
 
 ## API
 
@@ -160,6 +169,61 @@ Example response:
 }
 ```
 
+### Commit Consumer Offset
+
+```http
+POST /offsets/commit
+```
+
+Example request:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders",
+  "partition": 0,
+  "offset": 42
+}
+```
+
+Example response:
+
+```json
+{
+  "status": "committed"
+}
+```
+
+### Get Consumer Offset
+
+```http
+GET /offsets?group=analytics-workers&topic=orders&partition=0
+```
+
+Example response when found:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders",
+  "partition": 0,
+  "offset": 42,
+  "found": true
+}
+```
+
+Example response when not found:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders",
+  "partition": 0,
+  "offset": 0,
+  "found": false
+}
+```
+
 ## Running Tests
 
 Run all tests:
@@ -176,7 +240,7 @@ go test -c ./internal/server
 
 ## Current Status
 
-The project currently has a strong single-node storage foundation.
+The project currently has a strong single-node broker and storage foundation.
 
 Completed core areas:
 
@@ -184,16 +248,17 @@ Completed core areas:
 - Topic and partition management
 - Offset-aware append and fetch behavior
 - Segment files
-- Index files
+- Index files with real byte positions
 - Index-backed reads
 - Segment rotation
 - Missing-index rebuild on recovery
+- Consumer offset store
+- Consumer offset commit and lookup endpoints
 
 Still planned:
 
-- Stronger crash recovery behavior
-- Consumer offset commits
-- Consumer groups
+- Stronger crash recovery beyond missing-index rebuild
+- Consumer group balancing
 - CLI client
 - Docker Compose demo
 - Metrics and benchmarks
