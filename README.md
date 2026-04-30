@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, and consumer group assignment logic.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, and consumer group assignment.
 
 ## Current Features
 
@@ -14,6 +14,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 - Topic/partition-aware fetch endpoint (`GET /fetch`)
 - Consumer offset commit endpoint (`POST /offsets/commit`)
 - Consumer offset lookup endpoint (`GET /offsets`)
+- Consumer group assignment endpoint (`POST /groups/assign`)
 - In-memory log component
 - File-based storage component
 - Offset-aware records
@@ -60,7 +61,7 @@ If an index file is missing during partition-log startup, KairoLog can rebuild i
 
 Consumer offsets are stored separately so a consumer group can remember how far it has processed a topic partition.
 
-The group assignment engine distributes topic partitions across consumer group members in a deterministic and balanced way.
+The group assignment engine distributes topic partitions across consumer group members in a deterministic and balanced way. The HTTP broker exposes this through `POST /groups/assign`.
 
 ## Storage Layout
 
@@ -229,6 +230,55 @@ Example response when not found:
 }
 ```
 
+### Assign Topic Partitions to Group Members
+
+```http
+POST /groups/assign
+```
+
+Example request:
+
+```json
+{
+  "topic": "orders",
+  "members": [
+    {
+      "id": "member-a"
+    },
+    {
+      "id": "member-b"
+    }
+  ]
+}
+```
+
+Example response:
+
+```json
+{
+  "assignments": [
+    {
+      "member_id": "member-a",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [0, 1]
+        }
+      ]
+    },
+    {
+      "member_id": "member-b",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [2, 3]
+        }
+      ]
+    }
+  ]
+}
+```
+
 ## Consumer Group Assignment
 
 The group assignment engine distributes partitions across members.
@@ -281,12 +331,13 @@ Completed core areas:
 - Consumer offset store
 - Consumer offset commit and lookup endpoints
 - Consumer group assignment engine
+- Consumer group assignment endpoint
 
 Still planned:
 
-- HTTP endpoint for group assignment
 - Stronger crash recovery beyond missing-index rebuild
-- Consumer group balancing with membership lifecycle
+- Consumer group membership lifecycle
+- Heartbeats and real rebalancing behavior
 - CLI client
 - Docker Compose demo
 - Metrics and benchmarks
