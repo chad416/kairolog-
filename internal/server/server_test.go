@@ -8,8 +8,6 @@ import (
 	"os"
 	"reflect"
 	"testing"
-
-	"kairolog/internal/topic"
 )
 
 func TestHealth(t *testing.T) {
@@ -51,6 +49,34 @@ func TestCreateTopicAndListTopics(t *testing.T) {
 	}
 }
 
+func TestCreateTopicRejectsInvalidInput(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := createTopic(t, srv.Handler, "", 1)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+
+	recorder = createTopic(t, srv.Handler, "orders", 0)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
+func TestCreateTopicRejectsDuplicateTopic(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := createTopic(t, srv.Handler, "orders", 1)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("expected status %d, got %d", http.StatusCreated, recorder.Code)
+	}
+
+	recorder = createTopic(t, srv.Handler, "orders", 1)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("expected status %d, got %d", http.StatusConflict, recorder.Code)
+	}
+}
+
 func TestProduceStoresMessageInPartition(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -81,6 +107,22 @@ func TestProduceStoresMessageInPartition(t *testing.T) {
 	}
 }
 
+func TestProduceRejectsUnknownTopicOrPartition(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := produceMessage(t, srv.Handler, "missing", 0, "hello")
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected status %d, got %d", http.StatusNotFound, recorder.Code)
+	}
+
+	createTopic(t, srv.Handler, "orders", 1)
+
+	recorder = produceMessage(t, srv.Handler, "orders", 2, "hello")
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected status %d, got %d", http.StatusNotFound, recorder.Code)
+	}
+}
+
 func TestFetchReturnsRecordsFromOffset(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -100,11 +142,184 @@ func TestFetchReturnsRecordsFromOffset(t *testing.T) {
 	}
 }
 
+func TestFetchRejectsMissingOrInvalidOffset(t *testing.T) {
+	srv := newTestServer(t)
+
+	createTopic(t, srv.Handler, "orders", 1)
+
+	recorder := performRequest(srv.Handler, http.MethodGet, "/fetch?topic=orders&partition=0", nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+
+	recorder = performRequest(srv.Handler, http.MethodGet, "/fetch?topic=orders&partition=0&offset=invalid", nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
+func TestOffsetCommitAndGet(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := commitOffset(t, srv.Handler, "analytics-workers", "orders", 0, 42)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var commitResponse offsetCommitResponse
+	decodeJSON(t, recorder, &commitResponse)
+
+	if commitResponse.Status != "committed" {
+		t.Fatalf("expected status %q, got %q", "committed", commitResponse.Status)
+	}
+
+	offset := getOffset(t, srv.Handler, "/offsets?group=analytics-workers&topic=orders&partition=0")
+	expected := offsetResponse{
+		Group:     "analytics-workers",
+		Topic:     "orders",
+		Partition: 0,
+		Offset:    42,
+		Found:     true,
+	}
+
+	if !reflect.DeepEqual(offset, expected) {
+		t.Fatalf("expected %v, got %v", expected, offset)
+	}
+}
+
+func TestOffsetsReturnsNotFound(t *testing.T) {
+	srv := newTestServer(t)
+
+	offset := getOffset(t, srv.Handler, "/offsets?group=analytics-workers&topic=orders&partition=0")
+	expected := offsetResponse{
+		Group:     "analytics-workers",
+		Topic:     "orders",
+		Partition: 0,
+		Offset:    0,
+		Found:     false,
+	}
+
+	if !reflect.DeepEqual(offset, expected) {
+		t.Fatalf("expected %v, got %v", expected, offset)
+	}
+}
+
+func TestOffsetCommitRejectsInvalidInput(t *testing.T) {
+	srv := newTestServer(t)
+
+	tests := []struct {
+		name string
+		body interface{}
+	}{
+		{
+			name: "missing group",
+			body: map[string]interface{}{
+				"topic":     "orders",
+				"partition": 0,
+				"offset":    42,
+			},
+		},
+		{
+			name: "empty group",
+			body: offsetCommitRequest{
+				Group:     "",
+				Topic:     "orders",
+				Partition: 0,
+				Offset:    42,
+			},
+		},
+		{
+			name: "missing topic",
+			body: map[string]interface{}{
+				"group":     "analytics-workers",
+				"partition": 0,
+				"offset":    42,
+			},
+		},
+		{
+			name: "empty topic",
+			body: offsetCommitRequest{
+				Group:     "analytics-workers",
+				Topic:     "",
+				Partition: 0,
+				Offset:    42,
+			},
+		},
+		{
+			name: "invalid partition",
+			body: map[string]interface{}{
+				"group":     "analytics-workers",
+				"topic":     "orders",
+				"partition": "invalid",
+				"offset":    42,
+			},
+		},
+		{
+			name: "negative partition",
+			body: offsetCommitRequest{
+				Group:     "analytics-workers",
+				Topic:     "orders",
+				Partition: -1,
+				Offset:    42,
+			},
+		},
+		{
+			name: "negative offset",
+			body: offsetCommitRequest{
+				Group:     "analytics-workers",
+				Topic:     "orders",
+				Partition: 0,
+				Offset:    -1,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := performRequest(srv.Handler, http.MethodPost, "/offsets/commit", tt.body)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestOffsetsRejectsInvalidInput(t *testing.T) {
+	srv := newTestServer(t)
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "missing group", path: "/offsets?topic=orders&partition=0"},
+		{name: "empty group", path: "/offsets?group=&topic=orders&partition=0"},
+		{name: "missing topic", path: "/offsets?group=analytics-workers&partition=0"},
+		{name: "empty topic", path: "/offsets?group=analytics-workers&topic=&partition=0"},
+		{name: "missing partition", path: "/offsets?group=analytics-workers&topic=orders"},
+		{name: "invalid partition", path: "/offsets?group=analytics-workers&topic=orders&partition=invalid"},
+		{name: "negative partition", path: "/offsets?group=analytics-workers&topic=orders&partition=-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := performRequest(srv.Handler, http.MethodGet, tt.path, nil)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+			}
+		})
+	}
+}
+
 func newTestServer(t *testing.T) *http.Server {
 	t.Helper()
 	chdirTemp(t)
 
-	return newServer(topic.NewManager())
+	srv, err := New()
+	if err != nil {
+		t.Fatalf("failed to create test server: %v", err)
+	}
+
+	return srv
 }
 
 func createTopic(t *testing.T, handler http.Handler, name string, partitions int) *httptest.ResponseRecorder {
@@ -138,6 +353,31 @@ func fetchRecords(t *testing.T, handler http.Handler, path string) []fetchRecord
 	decodeJSON(t, recorder, &response)
 
 	return response.Records
+}
+
+func commitOffset(t *testing.T, handler http.Handler, group string, topicName string, partition int, offset int64) *httptest.ResponseRecorder {
+	t.Helper()
+
+	return performRequest(handler, http.MethodPost, "/offsets/commit", offsetCommitRequest{
+		Group:     group,
+		Topic:     topicName,
+		Partition: partition,
+		Offset:    offset,
+	})
+}
+
+func getOffset(t *testing.T, handler http.Handler, path string) offsetResponse {
+	t.Helper()
+
+	recorder := performRequest(handler, http.MethodGet, path, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response offsetResponse
+	decodeJSON(t, recorder, &response)
+
+	return response
 }
 
 func performRequest(handler http.Handler, method string, path string, body interface{}) *httptest.ResponseRecorder {

@@ -8,13 +8,16 @@ import (
 	"strconv"
 	"strings"
 
+	"kairolog/internal/consumer"
 	"kairolog/internal/topic"
 )
 
 const defaultAddr = ":8080"
+const defaultOffsetStorePath = "data/consumer_offsets.log"
 
 type Server struct {
 	topicManager *topic.Manager
+	offsetStore  *consumer.OffsetStore
 }
 
 type healthResponse struct {
@@ -50,13 +53,45 @@ type fetchResponse struct {
 	Records []fetchRecord `json:"records"`
 }
 
-func New() (*http.Server, error) {
-	return newServer(topic.NewManager()), nil
+type offsetCommitRequest struct {
+	Group     string `json:"group"`
+	Topic     string `json:"topic"`
+	Partition int    `json:"partition"`
+	Offset    int64  `json:"offset"`
 }
 
-func newServer(topicManager *topic.Manager) *http.Server {
+type offsetCommitResponse struct {
+	Status string `json:"status"`
+}
+
+type offsetResponse struct {
+	Group     string `json:"group"`
+	Topic     string `json:"topic"`
+	Partition int    `json:"partition"`
+	Offset    int64  `json:"offset"`
+	Found     bool   `json:"found"`
+}
+
+func New() (*http.Server, error) {
+	offsetStore, err := consumer.NewOffsetStore(defaultOffsetStorePath)
+	if err != nil {
+		return nil, fmt.Errorf("create offset store: %w", err)
+	}
+
+	return newServer(topic.NewManager(), offsetStore), nil
+}
+
+func newServer(topicManager *topic.Manager, offsetStores ...*consumer.OffsetStore) *http.Server {
+	var offsetStore *consumer.OffsetStore
+	if len(offsetStores) > 0 {
+		offsetStore = offsetStores[0]
+	} else {
+		offsetStore, _ = consumer.NewOffsetStore(defaultOffsetStorePath)
+	}
+
 	server := &Server{
 		topicManager: topicManager,
+		offsetStore:  offsetStore,
 	}
 
 	mux := http.NewServeMux()
@@ -64,6 +99,8 @@ func newServer(topicManager *topic.Manager) *http.Server {
 	mux.HandleFunc("/topics", server.topicsHandler)
 	mux.HandleFunc("/produce", server.produceHandler)
 	mux.HandleFunc("/fetch", server.fetchHandler)
+	mux.HandleFunc("/offsets/commit", server.offsetCommitHandler)
+	mux.HandleFunc("/offsets", server.offsetsHandler)
 
 	return &http.Server{
 		Addr:    defaultAddr,
@@ -135,11 +172,7 @@ func (s *Server) createTopicHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
-func (s *Server) listTopicsHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func (s *Server) listTopicsHandler(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, topicsResponse{Topics: s.topicManager.ListTopics()})
 }
 
@@ -236,6 +269,88 @@ func (s *Server) fetchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, fetchResponse{Records: responseRecords})
+}
+
+func (s *Server) offsetCommitHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req offsetCommitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	group := strings.TrimSpace(req.Group)
+	topicName := strings.TrimSpace(req.Topic)
+	if group == "" || topicName == "" || req.Partition < 0 || req.Offset < 0 {
+		http.Error(w, "invalid offset commit request", http.StatusBadRequest)
+		return
+	}
+
+	if s.offsetStore == nil {
+		http.Error(w, "offset store is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.offsetStore.Commit(group, topicName, req.Partition, req.Offset); err != nil {
+		http.Error(w, "failed to commit offset", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, offsetCommitResponse{Status: "committed"})
+}
+
+func (s *Server) offsetsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	group := strings.TrimSpace(r.URL.Query().Get("group"))
+	if group == "" {
+		http.Error(w, "missing group", http.StatusBadRequest)
+		return
+	}
+
+	topicName := strings.TrimSpace(r.URL.Query().Get("topic"))
+	if topicName == "" {
+		http.Error(w, "missing topic", http.StatusBadRequest)
+		return
+	}
+
+	partitionValue := r.URL.Query().Get("partition")
+	if partitionValue == "" {
+		http.Error(w, "missing partition", http.StatusBadRequest)
+		return
+	}
+
+	partitionID, err := strconv.Atoi(partitionValue)
+	if err != nil || partitionID < 0 {
+		http.Error(w, "invalid partition", http.StatusBadRequest)
+		return
+	}
+
+	if s.offsetStore == nil {
+		http.Error(w, "offset store is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	offset, found, err := s.offsetStore.Get(group, topicName, partitionID)
+	if err != nil {
+		http.Error(w, "failed to get offset", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, offsetResponse{
+		Group:     group,
+		Topic:     topicName,
+		Partition: partitionID,
+		Offset:    offset,
+		Found:     found,
+	})
 }
 
 func (s *Server) getPartition(topicName string, partitionID int) (topic.Partition, bool) {
