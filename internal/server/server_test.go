@@ -1,13 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
-	"strconv"
-	"strings"
 	"testing"
 
 	"kairolog/internal/topic"
@@ -16,19 +15,17 @@ import (
 func TestHealth(t *testing.T) {
 	srv := newTestServer(t)
 
-	recorder := performRequest(srv.Handler, http.MethodGet, "/health", "")
+	recorder := performRequest(srv.Handler, http.MethodGet, "/health", nil)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
 	}
 
 	var response healthResponse
-	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
+	decodeJSON(t, recorder, &response)
 
 	if response.Status != "ok" {
-		t.Fatalf("expected status ok, got %q", response.Status)
+		t.Fatalf("expected status %q, got %q", "ok", response.Status)
 	}
 }
 
@@ -40,19 +37,47 @@ func TestCreateTopicAndListTopics(t *testing.T) {
 		t.Fatalf("expected status %d, got %d", http.StatusCreated, recorder.Code)
 	}
 
-	recorder = performRequest(srv.Handler, http.MethodGet, "/topics", "")
+	recorder = performRequest(srv.Handler, http.MethodGet, "/topics", nil)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
 	}
 
 	var response topicsResponse
-	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
+	decodeJSON(t, recorder, &response)
 
 	expected := []string{"orders"}
 	if !reflect.DeepEqual(response.Topics, expected) {
 		t.Fatalf("expected %v, got %v", expected, response.Topics)
+	}
+}
+
+func TestProduceStoresMessageInPartition(t *testing.T) {
+	srv := newTestServer(t)
+
+	createTopic(t, srv.Handler, "orders", 2)
+
+	recorder := produceMessage(t, srv.Handler, "orders", 0, "hello")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response produceResponse
+	decodeJSON(t, recorder, &response)
+
+	if response.Status != "stored" {
+		t.Fatalf("expected status %q, got %q", "stored", response.Status)
+	}
+	if response.Offset != 0 {
+		t.Fatalf("expected offset 0, got %d", response.Offset)
+	}
+
+	records := fetchRecords(t, srv.Handler, "/fetch?topic=orders&partition=0&offset=0")
+	expected := []fetchRecord{
+		{Offset: 0, Message: "hello"},
+	}
+
+	if !reflect.DeepEqual(records, expected) {
+		t.Fatalf("expected %v, got %v", expected, records)
 	}
 }
 
@@ -85,41 +110,61 @@ func newTestServer(t *testing.T) *http.Server {
 func createTopic(t *testing.T, handler http.Handler, name string, partitions int) *httptest.ResponseRecorder {
 	t.Helper()
 
-	body := `{"name":"` + name + `","partitions":` + strconv.Itoa(partitions) + `}`
-	return performRequest(handler, http.MethodPost, "/topics", body)
+	return performRequest(handler, http.MethodPost, "/topics", createTopicRequest{
+		Name:       name,
+		Partitions: partitions,
+	})
 }
 
 func produceMessage(t *testing.T, handler http.Handler, topicName string, partition int, message string) *httptest.ResponseRecorder {
 	t.Helper()
 
-	body := `{"topic":"` + topicName + `","partition":` + strconv.Itoa(partition) + `,"message":"` + message + `"}`
-	return performRequest(handler, http.MethodPost, "/produce", body)
+	return performRequest(handler, http.MethodPost, "/produce", produceRequest{
+		Topic:     topicName,
+		Partition: partition,
+		Message:   message,
+	})
 }
 
 func fetchRecords(t *testing.T, handler http.Handler, path string) []fetchRecord {
 	t.Helper()
 
-	recorder := performRequest(handler, http.MethodGet, path, "")
+	recorder := performRequest(handler, http.MethodGet, path, nil)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
 	}
 
 	var response fetchResponse
-	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
+	decodeJSON(t, recorder, &response)
 
 	return response.Records
 }
 
-func performRequest(handler http.Handler, method, path, body string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(method, path, strings.NewReader(body))
+func performRequest(handler http.Handler, method string, path string, body interface{}) *httptest.ResponseRecorder {
+	requestBody := bytes.NewReader(nil)
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			panic(err)
+		}
+		requestBody = bytes.NewReader(data)
+	}
+
+	req := httptest.NewRequest(method, path, requestBody)
 	req.Header.Set("Content-Type", "application/json")
 
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 
 	return recorder
+}
+
+func decodeJSON(t *testing.T, recorder *httptest.ResponseRecorder, target interface{}) {
+	t.Helper()
+
+	if err := json.NewDecoder(recorder.Body).Decode(target); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
 }
 
 func chdirTemp(t *testing.T) {

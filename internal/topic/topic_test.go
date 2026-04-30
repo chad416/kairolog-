@@ -2,6 +2,7 @@ package topic
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -28,15 +29,21 @@ func TestCreateTopicCreatesPartitions(t *testing.T) {
 	}
 
 	for id, partition := range topic.Partitions {
-		expectedPath := partitionStoragePath("orders", id)
+		expectedDir := partitionDir("orders", id)
 		if partition.ID != id {
 			t.Fatalf("expected partition ID %d, got %d", id, partition.ID)
 		}
-		if partition.StoragePath != expectedPath {
-			t.Fatalf("expected storage path %q, got %q", expectedPath, partition.StoragePath)
+		if partition.Dir != expectedDir {
+			t.Fatalf("expected partition dir %q, got %q", expectedDir, partition.Dir)
 		}
-		if _, err := os.Stat(expectedPath); err != nil {
-			t.Fatalf("expected storage file %q to exist: %v", expectedPath, err)
+		if _, err := os.Stat(expectedDir); err != nil {
+			t.Fatalf("expected partition dir %q to exist: %v", expectedDir, err)
+		}
+		if _, err := os.Stat(filepath.Join(expectedDir, "00000000000000000000.log")); err != nil {
+			t.Fatalf("expected segment file to exist: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(expectedDir, "00000000000000000000.index")); err != nil {
+			t.Fatalf("expected index file to exist: %v", err)
 		}
 	}
 }

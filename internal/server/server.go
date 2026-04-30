@@ -7,18 +7,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 
-	"kairolog/internal/storage"
 	"kairolog/internal/topic"
 )
 
 const defaultAddr = ":8080"
 
 type Server struct {
-	topicManager    *topic.Manager
-	partitionStores map[string]*storage.FileStore
-	storeMu         sync.Mutex
+	topicManager *topic.Manager
 }
 
 type healthResponse struct {
@@ -60,8 +56,7 @@ func New() (*http.Server, error) {
 
 func newServer(topicManager *topic.Manager) *http.Server {
 	server := &Server{
-		topicManager:    topicManager,
-		partitionStores: make(map[string]*storage.FileStore),
+		topicManager: topicManager,
 	}
 
 	mux := http.NewServeMux()
@@ -140,7 +135,11 @@ func (s *Server) createTopicHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
-func (s *Server) listTopicsHandler(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) listTopicsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	writeJSON(w, http.StatusOK, topicsResponse{Topics: s.topicManager.ListTopics()})
 }
 
@@ -168,13 +167,7 @@ func (s *Server) produceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	store, err := s.partitionStore(partition.StoragePath)
-	if err != nil {
-		http.Error(w, "failed to open partition storage", http.StatusInternalServerError)
-		return
-	}
-
-	offset, err := store.AppendRecord(req.Message)
+	offset, err := partition.Append(req.Message)
 	if err != nil {
 		http.Error(w, "failed to store message", http.StatusInternalServerError)
 		return
@@ -228,13 +221,7 @@ func (s *Server) fetchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	store, err := s.partitionStore(partition.StoragePath)
-	if err != nil {
-		http.Error(w, "failed to open partition storage", http.StatusInternalServerError)
-		return
-	}
-
-	records, err := store.ReadAllRecords()
+	records, err := partition.ReadFrom(offset)
 	if err != nil {
 		http.Error(w, "failed to read records", http.StatusInternalServerError)
 		return
@@ -242,12 +229,10 @@ func (s *Server) fetchHandler(w http.ResponseWriter, r *http.Request) {
 
 	responseRecords := make([]fetchRecord, 0, len(records))
 	for _, record := range records {
-		if record.Offset >= offset {
-			responseRecords = append(responseRecords, fetchRecord{
-				Offset:  record.Offset,
-				Message: record.Message,
-			})
-		}
+		responseRecords = append(responseRecords, fetchRecord{
+			Offset:  record.Offset,
+			Message: record.Message,
+		})
 	}
 
 	writeJSON(w, http.StatusOK, fetchResponse{Records: responseRecords})
@@ -266,24 +251,6 @@ func (s *Server) getPartition(topicName string, partitionID int) (topic.Partitio
 	}
 
 	return topic.Partition{}, false
-}
-
-func (s *Server) partitionStore(path string) (*storage.FileStore, error) {
-	s.storeMu.Lock()
-	defer s.storeMu.Unlock()
-
-	store, exists := s.partitionStores[path]
-	if exists {
-		return store, nil
-	}
-
-	store, err := storage.NewFileStoreAt(path)
-	if err != nil {
-		return nil, err
-	}
-
-	s.partitionStores[path] = store
-	return store, nil
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, response interface{}) {

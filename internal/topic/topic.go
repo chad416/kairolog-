@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	"kairolog/internal/storage"
+	partitionlog "kairolog/internal/partition"
 )
 
 type Topic struct {
@@ -15,10 +15,10 @@ type Topic struct {
 }
 
 type Partition struct {
-	ID          int
-	StoragePath string
+	ID  int
+	Dir string
 
-	store *storage.FileStore
+	log *partitionlog.Log
 }
 
 type Manager struct {
@@ -54,16 +54,16 @@ func (m *Manager) CreateTopic(name string, partitionCount int) error {
 
 	partitions := make([]Partition, 0, partitionCount)
 	for id := 0; id < partitionCount; id++ {
-		storagePath := partitionStoragePath(name, id)
-		store, err := storage.NewFileStoreAt(storagePath)
+		dir := partitionDir(name, id)
+		log, err := partitionlog.NewLog(dir)
 		if err != nil {
-			return fmt.Errorf("create storage for topic %q partition %d: %w", name, id, err)
+			return fmt.Errorf("create log for topic %q partition %d: %w", name, id, err)
 		}
 
 		partitions = append(partitions, Partition{
-			ID:          id,
-			StoragePath: storagePath,
-			store:       store,
+			ID:  id,
+			Dir: dir,
+			log: log,
 		})
 	}
 
@@ -100,8 +100,24 @@ func (m *Manager) ListTopics() []string {
 	return topics
 }
 
-func partitionStoragePath(topicName string, partitionID int) string {
-	return fmt.Sprintf("data/%s/partition-%d/messages.log", topicName, partitionID)
+func (p Partition) Append(message string) (int64, error) {
+	if p.log == nil {
+		return 0, fmt.Errorf("partition log is not initialized")
+	}
+
+	return p.log.Append(message)
+}
+
+func (p Partition) ReadFrom(offset int64) ([]partitionlog.Record, error) {
+	if p.log == nil {
+		return nil, fmt.Errorf("partition log is not initialized")
+	}
+
+	return p.log.ReadFrom(offset)
+}
+
+func partitionDir(topicName string, partitionID int) string {
+	return fmt.Sprintf("data/%s/partition-%d", topicName, partitionID)
 }
 
 func cloneTopic(topic *Topic) *Topic {
