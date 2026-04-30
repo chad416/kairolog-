@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	indexpkg "kairolog/internal/index"
+	segmentpkg "kairolog/internal/segment"
 )
 
 func TestNewLogCreatesSegmentAndIndex(t *testing.T) {
@@ -25,7 +28,7 @@ func TestNewLogCreatesSegmentAndIndex(t *testing.T) {
 	}
 }
 
-func TestAppendReturnsOffsetsAndWritesIndexEntries(t *testing.T) {
+func TestAppendReturnsOffsetsAndWritesRealBytePositionIndexEntries(t *testing.T) {
 	log, err := NewLog(t.TempDir())
 	if err != nil {
 		t.Fatalf("failed to create partition log: %v", err)
@@ -56,6 +59,7 @@ func TestAppendReturnsOffsetsAndWritesIndexEntries(t *testing.T) {
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 index entries, got %d", len(entries))
 	}
+
 	if entries[0].Offset != 0 || entries[0].Position != 0 {
 		t.Fatalf("expected first index entry offset 0 position 0, got %+v", entries[0])
 	}
@@ -173,6 +177,51 @@ func TestLogRecoversRecordsOnReopen(t *testing.T) {
 		{Offset: 0, Message: "first"},
 		{Offset: 1, Message: "second"},
 		{Offset: 2, Message: "third"},
+	}
+
+	if !reflect.DeepEqual(records, expected) {
+		t.Fatalf("expected %v, got %v", expected, records)
+	}
+}
+
+func TestReadFromUsesIndexBackedPositionedReads(t *testing.T) {
+	dir := t.TempDir()
+
+	segment, err := segmentpkg.NewSegment(dir, 0)
+	if err != nil {
+		t.Fatalf("failed to create segment: %v", err)
+	}
+
+	index, err := indexpkg.NewIndex(dir, 0)
+	if err != nil {
+		t.Fatalf("failed to create index: %v", err)
+	}
+
+	if _, _, err := segment.AppendWithPosition("ignored"); err != nil {
+		t.Fatalf("failed to append ignored record: %v", err)
+	}
+
+	_, targetPosition, err := segment.AppendWithPosition("target")
+	if err != nil {
+		t.Fatalf("failed to append target record: %v", err)
+	}
+
+	if err := index.Append(10, targetPosition); err != nil {
+		t.Fatalf("failed to append index entry: %v", err)
+	}
+
+	log := &Log{
+		segment: segment,
+		index:   index,
+	}
+
+	records, err := log.ReadFrom(10)
+	if err != nil {
+		t.Fatalf("failed to read from offset: %v", err)
+	}
+
+	expected := []Record{
+		{Offset: 10, Message: "target"},
 	}
 
 	if !reflect.DeepEqual(records, expected) {

@@ -115,6 +115,45 @@ func (s *Segment) ReadAll() ([]Record, error) {
 	return records, nil
 }
 
+func (s *Segment) ReadFromPosition(startOffset int64, position int64) ([]Record, error) {
+	if startOffset < 0 {
+		return nil, fmt.Errorf("start offset cannot be negative")
+	}
+	if position < 0 {
+		return nil, fmt.Errorf("position cannot be negative")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	file, err := os.Open(s.path)
+	if err != nil {
+		return nil, fmt.Errorf("open segment for positioned read: %w", err)
+	}
+	defer file.Close()
+
+	if _, err := file.Seek(position, 0); err != nil {
+		return nil, fmt.Errorf("seek segment: %w", err)
+	}
+
+	records := make([]Record, 0)
+	offset := startOffset
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		records = append(records, Record{
+			Offset:  offset,
+			Message: scanner.Text(),
+		})
+		offset++
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read segment from position: %w", err)
+	}
+
+	return records, nil
+}
+
 func (s *Segment) BaseOffset() int64 {
 	return s.baseOffset
 }

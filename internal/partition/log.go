@@ -67,15 +67,32 @@ func (l *Log) ReadFrom(offset int64) ([]Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	records, err := l.readAll()
+	entries, err := l.index.ReadAll()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read index: %w", err)
 	}
 
-	filtered := make([]Record, 0, len(records))
-	for _, record := range records {
+	startOffset := l.segment.BaseOffset()
+	position := int64(0)
+	for _, entry := range entries {
+		if entry.Offset <= offset && entry.Offset >= startOffset {
+			startOffset = entry.Offset
+			position = entry.Position
+		}
+	}
+
+	segmentRecords, err := l.segment.ReadFromPosition(startOffset, position)
+	if err != nil {
+		return nil, fmt.Errorf("read segment from index position: %w", err)
+	}
+
+	filtered := make([]Record, 0, len(segmentRecords))
+	for _, record := range segmentRecords {
 		if record.Offset >= offset {
-			filtered = append(filtered, record)
+			filtered = append(filtered, Record{
+				Offset:  record.Offset,
+				Message: record.Message,
+			})
 		}
 	}
 
