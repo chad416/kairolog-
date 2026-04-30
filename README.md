@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, and consumer offset commits.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, and consumer group assignment logic.
 
 ## Current Features
 
@@ -29,10 +29,12 @@ The current focus is the single-node broker and storage foundation: topics, part
 - Recovery of offset-to-byte-position mappings
 - Consumer offset store
 - Persistent consumer offset commits
+- Consumer group assignment engine
+- Deterministic balanced partition assignment
 - Topic manager
 - Partition manager
 - Topic partitions wired to partition logs
-- Unit tests for log, storage, topic, server, segment, index, partition, and consumer packages
+- Unit tests for log, storage, topic, server, segment, index, partition, consumer, and group packages
 
 ## Current Architecture
 
@@ -45,6 +47,7 @@ server
 → segment files
 → index files
 → consumer offset store
+→ group assignment engine
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -56,6 +59,8 @@ Segment rotation creates new segment/index pairs when the active segment reaches
 If an index file is missing during partition-log startup, KairoLog can rebuild it by scanning the matching segment log file and restoring offset-to-byte-position mappings.
 
 Consumer offsets are stored separately so a consumer group can remember how far it has processed a topic partition.
+
+The group assignment engine distributes topic partitions across consumer group members in a deterministic and balanced way.
 
 ## Storage Layout
 
@@ -224,6 +229,27 @@ Example response when not found:
 }
 ```
 
+## Consumer Group Assignment
+
+The group assignment engine distributes partitions across members.
+
+Example:
+
+```text
+topic: orders
+partitions: 0, 1, 2, 3
+members: member-a, member-b
+```
+
+Result:
+
+```text
+member-a → partitions 0, 1
+member-b → partitions 2, 3
+```
+
+The assignment is deterministic because members are sorted by ID before partitions are assigned.
+
 ## Running Tests
 
 Run all tests:
@@ -254,11 +280,13 @@ Completed core areas:
 - Missing-index rebuild on recovery
 - Consumer offset store
 - Consumer offset commit and lookup endpoints
+- Consumer group assignment engine
 
 Still planned:
 
+- HTTP endpoint for group assignment
 - Stronger crash recovery beyond missing-index rebuild
-- Consumer group balancing
+- Consumer group balancing with membership lifecycle
 - CLI client
 - Docker Compose demo
 - Metrics and benchmarks
