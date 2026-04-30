@@ -20,6 +20,7 @@ type Server struct {
 	topicManager *topic.Manager
 	offsetStore  *consumer.OffsetStore
 	assigner     *group.Assigner
+	registry     *group.Registry
 }
 
 type healthResponse struct {
@@ -97,6 +98,24 @@ type groupTopicAssignmentResponse struct {
 	Partitions []int  `json:"partitions"`
 }
 
+type groupMembershipRequest struct {
+	Group    string `json:"group"`
+	MemberID string `json:"member_id"`
+}
+
+type groupMembershipResponse struct {
+	Status string `json:"status"`
+}
+
+type groupMembersResponse struct {
+	Group   string                `json:"group"`
+	Members []groupMemberResponse `json:"members"`
+}
+
+type groupMemberResponse struct {
+	ID string `json:"id"`
+}
+
 func New() (*http.Server, error) {
 	offsetStore, err := consumer.NewOffsetStore(defaultOffsetStorePath)
 	if err != nil {
@@ -118,6 +137,7 @@ func newServer(topicManager *topic.Manager, offsetStores ...*consumer.OffsetStor
 		topicManager: topicManager,
 		offsetStore:  offsetStore,
 		assigner:     group.NewAssigner(),
+		registry:     group.NewRegistry(),
 	}
 
 	mux := http.NewServeMux()
@@ -128,6 +148,9 @@ func newServer(topicManager *topic.Manager, offsetStores ...*consumer.OffsetStor
 	mux.HandleFunc("/offsets/commit", server.offsetCommitHandler)
 	mux.HandleFunc("/offsets", server.offsetsHandler)
 	mux.HandleFunc("/groups/assign", server.groupAssignHandler)
+	mux.HandleFunc("/groups/join", server.groupJoinHandler)
+	mux.HandleFunc("/groups/leave", server.groupLeaveHandler)
+	mux.HandleFunc("/groups/members", server.groupMembersHandler)
 
 	return &http.Server{
 		Addr:    defaultAddr,
@@ -430,6 +453,97 @@ func (s *Server) groupAssignHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) groupJoinHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req groupMembershipRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	groupName, memberID, ok := parseMembershipRequest(req)
+	if !ok {
+		http.Error(w, "invalid group membership request", http.StatusBadRequest)
+		return
+	}
+
+	if s.registry == nil {
+		http.Error(w, "group registry is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.registry.Join(groupName, memberID); err != nil {
+		http.Error(w, "failed to join group", http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupMembershipResponse{Status: "joined"})
+}
+
+func (s *Server) groupLeaveHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req groupMembershipRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	groupName, memberID, ok := parseMembershipRequest(req)
+	if !ok {
+		http.Error(w, "invalid group membership request", http.StatusBadRequest)
+		return
+	}
+
+	if s.registry == nil {
+		http.Error(w, "group registry is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.registry.Leave(groupName, memberID); err != nil {
+		http.Error(w, "failed to leave group", http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupMembershipResponse{Status: "left"})
+}
+
+func (s *Server) groupMembersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	groupName := strings.TrimSpace(r.URL.Query().Get("group"))
+	if groupName == "" {
+		http.Error(w, "missing group", http.StatusBadRequest)
+		return
+	}
+
+	if s.registry == nil {
+		http.Error(w, "group registry is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	members, err := s.registry.Members(groupName)
+	if err != nil {
+		http.Error(w, "failed to get group members", http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupMembersResponse{
+		Group:   groupName,
+		Members: convertGroupMembers(members),
+	})
+}
+
 func (s *Server) getPartition(topicName string, partitionID int) (topic.Partition, bool) {
 	topicInfo, exists := s.topicManager.GetTopic(topicName)
 	if !exists {
@@ -465,6 +579,13 @@ func parseGroupMembers(reqMembers []groupMemberRequest) ([]group.Member, error) 
 	return members, nil
 }
 
+func parseMembershipRequest(req groupMembershipRequest) (string, string, bool) {
+	groupName := strings.TrimSpace(req.Group)
+	memberID := strings.TrimSpace(req.MemberID)
+
+	return groupName, memberID, groupName != "" && memberID != ""
+}
+
 func convertGroupAssignments(assignments []group.Assignment) []groupAssignmentResponse {
 	responseAssignments := make([]groupAssignmentResponse, 0, len(assignments))
 	for _, assignment := range assignments {
@@ -483,6 +604,17 @@ func convertGroupAssignments(assignments []group.Assignment) []groupAssignmentRe
 	}
 
 	return responseAssignments
+}
+
+func convertGroupMembers(members []group.GroupMember) []groupMemberResponse {
+	responseMembers := make([]groupMemberResponse, 0, len(members))
+	for _, member := range members {
+		responseMembers = append(responseMembers, groupMemberResponse{
+			ID: member.ID,
+		})
+	}
+
+	return responseMembers
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, response interface{}) {

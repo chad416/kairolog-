@@ -436,6 +436,273 @@ func TestGroupAssignRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestGroupJoin(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupMembershipResponse
+	decodeJSON(t, recorder, &response)
+	if response.Status != "joined" {
+		t.Fatalf("expected status %q, got %q", "joined", response.Status)
+	}
+
+	members := getGroupMembers(t, srv.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{{ID: "member-a"}},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupJoinDuplicateIsIdempotent(t *testing.T) {
+	srv := newTestServer(t)
+
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	recorder := joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	members := getGroupMembers(t, srv.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{{ID: "member-a"}},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupLeave(t *testing.T) {
+	srv := newTestServer(t)
+
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+
+	recorder := leaveGroup(t, srv.Handler, "analytics-workers", "member-a")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupMembershipResponse
+	decodeJSON(t, recorder, &response)
+	if response.Status != "left" {
+		t.Fatalf("expected status %q, got %q", "left", response.Status)
+	}
+
+	members := getGroupMembers(t, srv.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupLeaveMissingMemberIsIdempotent(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := leaveGroup(t, srv.Handler, "analytics-workers", "member-a")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	members := getGroupMembers(t, srv.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupMembersAreReturnedSorted(t *testing.T) {
+	srv := newTestServer(t)
+
+	joinGroup(t, srv.Handler, "analytics-workers", "member-c")
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	joinGroup(t, srv.Handler, "analytics-workers", "member-b")
+
+	members := getGroupMembers(t, srv.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group: "analytics-workers",
+		Members: []groupMemberResponse{
+			{ID: "member-a"},
+			{ID: "member-b"},
+			{ID: "member-c"},
+		},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupMembersAreIsolatedByGroup(t *testing.T) {
+	srv := newTestServer(t)
+
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	joinGroup(t, srv.Handler, "billing-workers", "member-b")
+
+	members := getGroupMembers(t, srv.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{{ID: "member-a"}},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupJoinRejectsInvalidBody(t *testing.T) {
+	srv := newTestServer(t)
+
+	tests := []struct {
+		name string
+		body interface{}
+	}{
+		{
+			name: "missing group",
+			body: map[string]interface{}{
+				"member_id": "member-a",
+			},
+		},
+		{
+			name: "empty group",
+			body: groupMembershipRequest{
+				Group:    "",
+				MemberID: "member-a",
+			},
+		},
+		{
+			name: "missing member ID",
+			body: map[string]interface{}{
+				"group": "analytics-workers",
+			},
+		},
+		{
+			name: "empty member ID",
+			body: groupMembershipRequest{
+				Group:    "analytics-workers",
+				MemberID: "",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := performRequest(srv.Handler, http.MethodPost, "/groups/join", tt.body)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+			}
+		})
+	}
+
+	recorder := performRawRequest(srv.Handler, http.MethodPost, "/groups/join", "{")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
+func TestGroupLeaveRejectsInvalidBody(t *testing.T) {
+	srv := newTestServer(t)
+
+	tests := []struct {
+		name string
+		body interface{}
+	}{
+		{
+			name: "missing group",
+			body: map[string]interface{}{
+				"member_id": "member-a",
+			},
+		},
+		{
+			name: "empty group",
+			body: groupMembershipRequest{
+				Group:    "",
+				MemberID: "member-a",
+			},
+		},
+		{
+			name: "missing member ID",
+			body: map[string]interface{}{
+				"group": "analytics-workers",
+			},
+		},
+		{
+			name: "empty member ID",
+			body: groupMembershipRequest{
+				Group:    "analytics-workers",
+				MemberID: "",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := performRequest(srv.Handler, http.MethodPost, "/groups/leave", tt.body)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+			}
+		})
+	}
+
+	recorder := performRawRequest(srv.Handler, http.MethodPost, "/groups/leave", "{")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
+func TestGroupMembersRejectsMissingGroup(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRequest(srv.Handler, http.MethodGet, "/groups/members", nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+
+	recorder = performRequest(srv.Handler, http.MethodGet, "/groups/members?group=", nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
+func TestGroupMembershipRejectsWrongMethods(t *testing.T) {
+	srv := newTestServer(t)
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "join", method: http.MethodGet, path: "/groups/join"},
+		{name: "leave", method: http.MethodGet, path: "/groups/leave"},
+		{name: "members", method: http.MethodPost, path: "/groups/members?group=analytics-workers"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := performRequest(srv.Handler, tt.method, tt.path, nil)
+			if recorder.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("expected status %d, got %d", http.StatusMethodNotAllowed, recorder.Code)
+			}
+		})
+	}
+}
+
 func newTestServer(t *testing.T) *http.Server {
 	t.Helper()
 	chdirTemp(t)
@@ -518,6 +785,38 @@ func assignGroup(t *testing.T, handler http.Handler, topicName string, memberIDs
 		Topic:   topicName,
 		Members: members,
 	})
+}
+
+func joinGroup(t *testing.T, handler http.Handler, groupName string, memberID string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	return performRequest(handler, http.MethodPost, "/groups/join", groupMembershipRequest{
+		Group:    groupName,
+		MemberID: memberID,
+	})
+}
+
+func leaveGroup(t *testing.T, handler http.Handler, groupName string, memberID string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	return performRequest(handler, http.MethodPost, "/groups/leave", groupMembershipRequest{
+		Group:    groupName,
+		MemberID: memberID,
+	})
+}
+
+func getGroupMembers(t *testing.T, handler http.Handler, groupName string) groupMembersResponse {
+	t.Helper()
+
+	recorder := performRequest(handler, http.MethodGet, "/groups/members?group="+groupName, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupMembersResponse
+	decodeJSON(t, recorder, &response)
+
+	return response
 }
 
 func performRequest(handler http.Handler, method string, path string, body interface{}) *httptest.ResponseRecorder {
