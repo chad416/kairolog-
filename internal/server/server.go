@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"kairolog/internal/consumer"
+	"kairolog/internal/group"
 	"kairolog/internal/topic"
 )
 
@@ -18,6 +19,7 @@ const defaultOffsetStorePath = "data/consumer_offsets.log"
 type Server struct {
 	topicManager *topic.Manager
 	offsetStore  *consumer.OffsetStore
+	assigner     *group.Assigner
 }
 
 type healthResponse struct {
@@ -72,6 +74,29 @@ type offsetResponse struct {
 	Found     bool   `json:"found"`
 }
 
+type groupAssignRequest struct {
+	Topic   string               `json:"topic"`
+	Members []groupMemberRequest `json:"members"`
+}
+
+type groupMemberRequest struct {
+	ID string `json:"id"`
+}
+
+type groupAssignResponse struct {
+	Assignments []groupAssignmentResponse `json:"assignments"`
+}
+
+type groupAssignmentResponse struct {
+	MemberID string                         `json:"member_id"`
+	Topics   []groupTopicAssignmentResponse `json:"topics"`
+}
+
+type groupTopicAssignmentResponse struct {
+	Topic      string `json:"topic"`
+	Partitions []int  `json:"partitions"`
+}
+
 func New() (*http.Server, error) {
 	offsetStore, err := consumer.NewOffsetStore(defaultOffsetStorePath)
 	if err != nil {
@@ -92,6 +117,7 @@ func newServer(topicManager *topic.Manager, offsetStores ...*consumer.OffsetStor
 	server := &Server{
 		topicManager: topicManager,
 		offsetStore:  offsetStore,
+		assigner:     group.NewAssigner(),
 	}
 
 	mux := http.NewServeMux()
@@ -101,6 +127,7 @@ func newServer(topicManager *topic.Manager, offsetStores ...*consumer.OffsetStor
 	mux.HandleFunc("/fetch", server.fetchHandler)
 	mux.HandleFunc("/offsets/commit", server.offsetCommitHandler)
 	mux.HandleFunc("/offsets", server.offsetsHandler)
+	mux.HandleFunc("/groups/assign", server.groupAssignHandler)
 
 	return &http.Server{
 		Addr:    defaultAddr,
@@ -353,6 +380,56 @@ func (s *Server) offsetsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) groupAssignHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req groupAssignRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	topicName := strings.TrimSpace(req.Topic)
+	if topicName == "" {
+		http.Error(w, "missing topic", http.StatusBadRequest)
+		return
+	}
+	if len(req.Members) == 0 {
+		http.Error(w, "missing members", http.StatusBadRequest)
+		return
+	}
+
+	members, err := parseGroupMembers(req.Members)
+	if err != nil {
+		http.Error(w, "invalid members", http.StatusBadRequest)
+		return
+	}
+
+	topicInfo, exists := s.topicManager.GetTopic(topicName)
+	if !exists {
+		http.Error(w, "topic not found", http.StatusNotFound)
+		return
+	}
+
+	if s.assigner == nil {
+		http.Error(w, "assigner is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	assignments, err := s.assigner.Assign(topicName, len(topicInfo.Partitions), members)
+	if err != nil {
+		http.Error(w, "failed to assign partitions", http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupAssignResponse{
+		Assignments: convertGroupAssignments(assignments),
+	})
+}
+
 func (s *Server) getPartition(topicName string, partitionID int) (topic.Partition, bool) {
 	topicInfo, exists := s.topicManager.GetTopic(topicName)
 	if !exists {
@@ -366,6 +443,46 @@ func (s *Server) getPartition(topicName string, partitionID int) (topic.Partitio
 	}
 
 	return topic.Partition{}, false
+}
+
+func parseGroupMembers(reqMembers []groupMemberRequest) ([]group.Member, error) {
+	members := make([]group.Member, 0, len(reqMembers))
+	seen := make(map[string]struct{}, len(reqMembers))
+
+	for _, reqMember := range reqMembers {
+		id := strings.TrimSpace(reqMember.ID)
+		if id == "" {
+			return nil, fmt.Errorf("member ID cannot be empty")
+		}
+		if _, exists := seen[id]; exists {
+			return nil, fmt.Errorf("duplicate member ID %q", id)
+		}
+
+		seen[id] = struct{}{}
+		members = append(members, group.Member{ID: id})
+	}
+
+	return members, nil
+}
+
+func convertGroupAssignments(assignments []group.Assignment) []groupAssignmentResponse {
+	responseAssignments := make([]groupAssignmentResponse, 0, len(assignments))
+	for _, assignment := range assignments {
+		topics := make([]groupTopicAssignmentResponse, 0, len(assignment.Topics))
+		for _, topicAssignment := range assignment.Topics {
+			topics = append(topics, groupTopicAssignmentResponse{
+				Topic:      topicAssignment.Topic,
+				Partitions: topicAssignment.Partitions,
+			})
+		}
+
+		responseAssignments = append(responseAssignments, groupAssignmentResponse{
+			MemberID: assignment.MemberID,
+			Topics:   topics,
+		})
+	}
+
+	return responseAssignments
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, response interface{}) {

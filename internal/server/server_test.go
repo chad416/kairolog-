@@ -310,6 +310,132 @@ func TestOffsetsRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestGroupAssignReturnsAssignments(t *testing.T) {
+	srv := newTestServer(t)
+
+	createTopic(t, srv.Handler, "orders", 4)
+
+	recorder := assignGroup(t, srv.Handler, "orders", "member-b", "member-a")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupAssignResponse
+	decodeJSON(t, recorder, &response)
+
+	expected := groupAssignResponse{
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-a",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0, 1}},
+				},
+			},
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{2, 3}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupAssignRejectsUnknownTopic(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := assignGroup(t, srv.Handler, "missing", "member-a")
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected status %d, got %d", http.StatusNotFound, recorder.Code)
+	}
+}
+
+func TestGroupAssignRejectsWrongMethod(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRequest(srv.Handler, http.MethodGet, "/groups/assign", nil)
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected status %d, got %d", http.StatusMethodNotAllowed, recorder.Code)
+	}
+}
+
+func TestGroupAssignRejectsInvalidInput(t *testing.T) {
+	srv := newTestServer(t)
+
+	createTopic(t, srv.Handler, "orders", 2)
+
+	tests := []struct {
+		name string
+		body interface{}
+	}{
+		{
+			name: "missing topic",
+			body: map[string]interface{}{
+				"members": []map[string]string{{"id": "member-a"}},
+			},
+		},
+		{
+			name: "empty topic",
+			body: groupAssignRequest{
+				Topic:   "",
+				Members: []groupMemberRequest{{ID: "member-a"}},
+			},
+		},
+		{
+			name: "missing members",
+			body: groupAssignRequest{
+				Topic: "orders",
+			},
+		},
+		{
+			name: "empty members",
+			body: groupAssignRequest{
+				Topic:   "orders",
+				Members: []groupMemberRequest{},
+			},
+		},
+		{
+			name: "empty member ID",
+			body: groupAssignRequest{
+				Topic:   "orders",
+				Members: []groupMemberRequest{{ID: ""}},
+			},
+		},
+		{
+			name: "duplicate member ID",
+			body: groupAssignRequest{
+				Topic: "orders",
+				Members: []groupMemberRequest{
+					{ID: "member-a"},
+					{ID: "member-a"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := performRequest(srv.Handler, http.MethodPost, "/groups/assign", tt.body)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestGroupAssignRejectsInvalidJSON(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRawRequest(srv.Handler, http.MethodPost, "/groups/assign", "{")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
 func newTestServer(t *testing.T) *http.Server {
 	t.Helper()
 	chdirTemp(t)
@@ -380,6 +506,20 @@ func getOffset(t *testing.T, handler http.Handler, path string) offsetResponse {
 	return response
 }
 
+func assignGroup(t *testing.T, handler http.Handler, topicName string, memberIDs ...string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	members := make([]groupMemberRequest, 0, len(memberIDs))
+	for _, memberID := range memberIDs {
+		members = append(members, groupMemberRequest{ID: memberID})
+	}
+
+	return performRequest(handler, http.MethodPost, "/groups/assign", groupAssignRequest{
+		Topic:   topicName,
+		Members: members,
+	})
+}
+
 func performRequest(handler http.Handler, method string, path string, body interface{}) *httptest.ResponseRecorder {
 	requestBody := bytes.NewReader(nil)
 	if body != nil {
@@ -391,6 +531,16 @@ func performRequest(handler http.Handler, method string, path string, body inter
 	}
 
 	req := httptest.NewRequest(method, path, requestBody)
+	req.Header.Set("Content-Type", "application/json")
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	return recorder
+}
+
+func performRawRequest(handler http.Handler, method string, path string, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	recorder := httptest.NewRecorder()
