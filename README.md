@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, and consumer group membership.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, and heartbeat tracking.
 
 ## Current Features
 
@@ -37,6 +37,8 @@ The current focus is the single-node broker and storage foundation: topics, part
 - Deterministic balanced partition assignment
 - Consumer group membership registry
 - Join/leave group membership lifecycle
+- Group member heartbeat tracking
+- Last-seen timestamp tracking for group members
 - Topic manager
 - Partition manager
 - Topic partitions wired to partition logs
@@ -55,6 +57,7 @@ server
 → consumer offset store
 → group assignment engine
 → group membership registry
+→ heartbeat tracking
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -70,6 +73,8 @@ Consumer offsets are stored separately so a consumer group can remember how far 
 The group assignment engine distributes topic partitions across consumer group members in a deterministic and balanced way. The HTTP broker exposes this through `POST /groups/assign`.
 
 The group membership registry tracks members joining and leaving consumer groups. The HTTP broker exposes this through `POST /groups/join`, `POST /groups/leave`, and `GET /groups/members`.
+
+The group registry also tracks `LastSeen` timestamps for members. A member receives a timestamp when it joins, and the internal heartbeat method can update that timestamp when the member is seen again.
 
 ## Storage Layout
 
@@ -94,7 +99,7 @@ Index files store offset-to-byte-position mappings.
 
 The consumer offset file stores committed offsets for consumer groups.
 
-Current group membership is in-memory only and is not persisted yet.
+Current group membership and heartbeat state are in-memory only and are not persisted yet.
 
 ## API
 
@@ -399,7 +404,29 @@ duplicate joins are idempotent
 leaving a missing member is idempotent
 ```
 
-Membership is currently in-memory only. It is not persisted and does not include heartbeats or automatic rebalancing yet.
+Membership is currently in-memory only. It is not persisted yet.
+
+## Heartbeat Tracking
+
+The group registry tracks when each group member was last seen.
+
+Current behavior:
+
+```text
+Join(group, memberID)
+→ adds the member
+→ sets LastSeen for a new member
+
+Heartbeat(group, memberID, now)
+→ updates LastSeen for an existing member
+→ adds the member if it is missing
+
+Leave(group, memberID)
+→ removes the member
+→ removes its LastSeen timestamp
+```
+
+Heartbeat tracking is currently implemented inside the group registry. It is not exposed through the HTTP API yet.
 
 ## Running Tests
 
@@ -435,12 +462,15 @@ Completed core areas:
 - Consumer group assignment endpoint
 - Consumer group membership registry
 - Consumer group membership endpoints
+- Internal heartbeat tracking foundation
 
 Still planned:
 
+- HTTP heartbeat endpoint (`POST /groups/heartbeat`)
+- Stale member detection
+- Automatic group rebalancing behavior
 - Stronger crash recovery beyond missing-index rebuild
-- Persistent group membership
-- Heartbeats and real rebalancing behavior
+- Persistent group membership and heartbeat state
 - CLI client
 - Docker Compose demo
 - Metrics and benchmarks
