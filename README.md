@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, and heartbeat tracking.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, and stale member detection.
 
 ## Current Features
 
@@ -40,6 +40,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 - Join/leave group membership lifecycle
 - Group member heartbeat tracking
 - Last-seen timestamp tracking for group members
+- Internal stale group member detection
 - Topic manager
 - Partition manager
 - Topic partitions wired to partition logs
@@ -59,6 +60,7 @@ server
 → group assignment engine
 → group membership registry
 → heartbeat tracking
+→ stale member detection
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -76,6 +78,8 @@ The group assignment engine distributes topic partitions across consumer group m
 The group membership registry tracks members joining and leaving consumer groups. The HTTP broker exposes this through `POST /groups/join`, `POST /groups/leave`, and `GET /groups/members`.
 
 The group registry also tracks `LastSeen` timestamps for members. A member receives a timestamp when it joins, and the heartbeat endpoint updates that timestamp when the member is seen again.
+
+The group registry can detect stale members by comparing each member’s `LastSeen` timestamp against a timeout window. Stale detection is currently internal only and does not automatically remove members or trigger rebalancing.
 
 ## Storage Layout
 
@@ -100,7 +104,7 @@ Index files store offset-to-byte-position mappings.
 
 The consumer offset file stores committed offsets for consumer groups.
 
-Current group membership and heartbeat state are in-memory only and are not persisted yet.
+Current group membership, heartbeat state, and stale-member detection state are in-memory only and are not persisted yet.
 
 ## API
 
@@ -456,9 +460,42 @@ Leave(group, memberID)
 → removes its LastSeen timestamp
 ```
 
-Heartbeat tracking is now implemented inside the group registry and exposed through `POST /groups/heartbeat`.
+Heartbeat tracking is implemented inside the group registry and exposed through `POST /groups/heartbeat`.
 
 Heartbeat tracking does not yet automatically remove stale members or trigger rebalancing.
+
+## Stale Member Detection
+
+The group registry can detect stale members using each member’s `LastSeen` timestamp.
+
+Current behavior:
+
+```text
+StaleMembers(group, now, timeout)
+→ checks all members in the group
+→ returns members where now - LastSeen > timeout
+→ returns stale members sorted by member ID
+```
+
+Example:
+
+```text
+now: 12:00
+timeout: 5 minutes
+
+member-a LastSeen: 11:54 → stale
+member-b LastSeen: 11:57 → active
+member-c LastSeen: 11:50 → stale
+```
+
+Result:
+
+```text
+member-a
+member-c
+```
+
+Stale member detection is currently internal only. It does not remove stale members, persist stale state, or trigger automatic rebalancing yet.
 
 ## Running Tests
 
@@ -496,10 +533,11 @@ Completed core areas:
 - Consumer group membership endpoints
 - Internal heartbeat tracking foundation
 - Consumer group heartbeat endpoint
+- Internal stale member detection
 
 Still planned:
 
-- Stale member detection
+- HTTP stale member endpoint (`GET /groups/stale`)
 - Automatic group rebalancing behavior
 - Stronger crash recovery beyond missing-index rebuild
 - Persistent group membership and heartbeat state
