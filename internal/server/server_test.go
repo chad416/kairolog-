@@ -441,6 +441,205 @@ func TestGroupAssignRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestGroupRebalanceAssignsTopicPartitionsToRegisteredMembers(t *testing.T) {
+	srv := newTestServer(t)
+
+	createTopic(t, srv.Handler, "orders", 4)
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	joinGroup(t, srv.Handler, "analytics-workers", "member-b")
+
+	recorder := rebalanceGroup(t, srv.Handler, "analytics-workers", "orders")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupRebalanceResponse
+	decodeJSON(t, recorder, &response)
+
+	expected := groupRebalanceResponse{
+		Group: "analytics-workers",
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-a",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0, 1}},
+				},
+			},
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{2, 3}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupRebalanceAssignsMembersDeterministicallyByID(t *testing.T) {
+	srv := newTestServer(t)
+
+	createTopic(t, srv.Handler, "orders", 2)
+	joinGroup(t, srv.Handler, "analytics-workers", "member-b")
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+
+	recorder := rebalanceGroup(t, srv.Handler, "analytics-workers", "orders")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupRebalanceResponse
+	decodeJSON(t, recorder, &response)
+
+	expected := groupRebalanceResponse{
+		Group: "analytics-workers",
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-a",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0}},
+				},
+			},
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{1}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupRebalanceAssignsUnevenPartitions(t *testing.T) {
+	srv := newTestServer(t)
+
+	createTopic(t, srv.Handler, "orders", 5)
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	joinGroup(t, srv.Handler, "analytics-workers", "member-b")
+
+	recorder := rebalanceGroup(t, srv.Handler, "analytics-workers", "orders")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupRebalanceResponse
+	decodeJSON(t, recorder, &response)
+
+	expected := groupRebalanceResponse{
+		Group: "analytics-workers",
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-a",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0, 1, 2}},
+				},
+			},
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{3, 4}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupRebalanceRejectsGroupWithNoMembers(t *testing.T) {
+	srv := newTestServer(t)
+
+	createTopic(t, srv.Handler, "orders", 2)
+
+	recorder := rebalanceGroup(t, srv.Handler, "analytics-workers", "orders")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
+func TestGroupRebalanceRejectsUnknownTopic(t *testing.T) {
+	srv := newTestServer(t)
+
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+
+	recorder := rebalanceGroup(t, srv.Handler, "analytics-workers", "missing")
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected status %d, got %d", http.StatusNotFound, recorder.Code)
+	}
+}
+
+func TestGroupRebalanceRejectsInvalidBody(t *testing.T) {
+	srv := newTestServer(t)
+
+	tests := []struct {
+		name string
+		body interface{}
+	}{
+		{
+			name: "missing group",
+			body: map[string]interface{}{
+				"topic": "orders",
+			},
+		},
+		{
+			name: "empty group",
+			body: groupRebalanceRequest{
+				Group: "",
+				Topic: "orders",
+			},
+		},
+		{
+			name: "missing topic",
+			body: map[string]interface{}{
+				"group": "analytics-workers",
+			},
+		},
+		{
+			name: "empty topic",
+			body: groupRebalanceRequest{
+				Group: "analytics-workers",
+				Topic: "",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := performRequest(srv.Handler, http.MethodPost, "/groups/rebalance", tt.body)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestGroupRebalanceRejectsInvalidJSON(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRawRequest(srv.Handler, http.MethodPost, "/groups/rebalance", "{")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
+func TestGroupRebalanceRejectsWrongMethod(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRequest(srv.Handler, http.MethodGet, "/groups/rebalance", nil)
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected status %d, got %d", http.StatusMethodNotAllowed, recorder.Code)
+	}
+}
+
 func TestGroupJoin(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -1155,6 +1354,7 @@ func TestGroupMembershipRejectsWrongMethods(t *testing.T) {
 		{name: "members", method: http.MethodPost, path: "/groups/members?group=analytics-workers"},
 		{name: "stale", method: http.MethodPost, path: "/groups/stale?group=analytics-workers&timeout_ms=300000"},
 		{name: "remove stale", method: http.MethodGet, path: "/groups/remove-stale"},
+		{name: "rebalance", method: http.MethodGet, path: "/groups/rebalance"},
 	}
 
 	for _, tt := range tests {
@@ -1271,6 +1471,15 @@ func assignGroup(t *testing.T, handler http.Handler, topicName string, memberIDs
 	return performRequest(handler, http.MethodPost, "/groups/assign", groupAssignRequest{
 		Topic:   topicName,
 		Members: members,
+	})
+}
+
+func rebalanceGroup(t *testing.T, handler http.Handler, groupName string, topicName string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	return performRequest(handler, http.MethodPost, "/groups/rebalance", groupRebalanceRequest{
+		Group: groupName,
+		Topic: topicName,
 	})
 }
 

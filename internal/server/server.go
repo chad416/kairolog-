@@ -89,6 +89,16 @@ type groupAssignResponse struct {
 	Assignments []groupAssignmentResponse `json:"assignments"`
 }
 
+type groupRebalanceRequest struct {
+	Group string `json:"group"`
+	Topic string `json:"topic"`
+}
+
+type groupRebalanceResponse struct {
+	Group       string                    `json:"group"`
+	Assignments []groupAssignmentResponse `json:"assignments"`
+}
+
 type groupAssignmentResponse struct {
 	MemberID string                         `json:"member_id"`
 	Topics   []groupTopicAssignmentResponse `json:"topics"`
@@ -179,6 +189,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/groups/members", s.groupMembersHandler)
 	mux.HandleFunc("/groups/stale", s.groupStaleHandler)
 	mux.HandleFunc("/groups/remove-stale", s.groupRemoveStaleHandler)
+	mux.HandleFunc("/groups/rebalance", s.groupRebalanceHandler)
 
 	return mux
 }
@@ -474,6 +485,73 @@ func (s *Server) groupAssignHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, groupAssignResponse{
+		Assignments: convertGroupAssignments(assignments),
+	})
+}
+
+func (s *Server) groupRebalanceHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req groupRebalanceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	groupName := strings.TrimSpace(req.Group)
+	if groupName == "" {
+		http.Error(w, "missing group", http.StatusBadRequest)
+		return
+	}
+
+	topicName := strings.TrimSpace(req.Topic)
+	if topicName == "" {
+		http.Error(w, "missing topic", http.StatusBadRequest)
+		return
+	}
+
+	if s.registry == nil {
+		http.Error(w, "group registry is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	registeredMembers, err := s.registry.Members(groupName)
+	if err != nil {
+		http.Error(w, "failed to get group members", http.StatusBadRequest)
+		return
+	}
+	if len(registeredMembers) == 0 {
+		http.Error(w, "group has no members", http.StatusBadRequest)
+		return
+	}
+
+	topicInfo, exists := s.topicManager.GetTopic(topicName)
+	if !exists {
+		http.Error(w, "topic not found", http.StatusNotFound)
+		return
+	}
+
+	if s.assigner == nil {
+		http.Error(w, "assigner is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	members := make([]group.Member, 0, len(registeredMembers))
+	for _, member := range registeredMembers {
+		members = append(members, group.Member{ID: member.ID})
+	}
+
+	assignments, err := s.assigner.Assign(topicName, len(topicInfo.Partitions), members)
+	if err != nil {
+		http.Error(w, "failed to assign partitions", http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupRebalanceResponse{
+		Group:       groupName,
 		Assignments: convertGroupAssignments(assignments),
 	})
 }
