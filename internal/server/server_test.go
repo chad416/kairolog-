@@ -527,6 +527,122 @@ func TestGroupLeaveMissingMemberIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestGroupHeartbeatRecordsHeartbeat(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := heartbeatGroup(t, srv.Handler, "analytics-workers", "member-a")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupMembershipResponse
+	decodeJSON(t, recorder, &response)
+	if response.Status != "heartbeat recorded" {
+		t.Fatalf("expected status %q, got %q", "heartbeat recorded", response.Status)
+	}
+
+	members := getGroupMembers(t, srv.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{{ID: "member-a"}},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupHeartbeatAddsMissingMember(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := heartbeatGroup(t, srv.Handler, "analytics-workers", "member-a")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	members := getGroupMembers(t, srv.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{{ID: "member-a"}},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupHeartbeatUpdatesExistingMemberWithoutDuplicate(t *testing.T) {
+	srv := newTestServer(t)
+
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	heartbeatGroup(t, srv.Handler, "analytics-workers", "member-a")
+	heartbeatGroup(t, srv.Handler, "analytics-workers", "member-a")
+
+	members := getGroupMembers(t, srv.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{{ID: "member-a"}},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupHeartbeatRejectsInvalidBody(t *testing.T) {
+	srv := newTestServer(t)
+
+	tests := []struct {
+		name string
+		body interface{}
+	}{
+		{
+			name: "missing group",
+			body: map[string]interface{}{
+				"member_id": "member-a",
+			},
+		},
+		{
+			name: "empty group",
+			body: groupMembershipRequest{
+				Group:    "",
+				MemberID: "member-a",
+			},
+		},
+		{
+			name: "missing member ID",
+			body: map[string]interface{}{
+				"group": "analytics-workers",
+			},
+		},
+		{
+			name: "empty member ID",
+			body: groupMembershipRequest{
+				Group:    "analytics-workers",
+				MemberID: "",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := performRequest(srv.Handler, http.MethodPost, "/groups/heartbeat", tt.body)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestGroupHeartbeatRejectsInvalidJSON(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRawRequest(srv.Handler, http.MethodPost, "/groups/heartbeat", "{")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
 func TestGroupMembersAreReturnedSorted(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -690,6 +806,7 @@ func TestGroupMembershipRejectsWrongMethods(t *testing.T) {
 	}{
 		{name: "join", method: http.MethodGet, path: "/groups/join"},
 		{name: "leave", method: http.MethodGet, path: "/groups/leave"},
+		{name: "heartbeat", method: http.MethodGet, path: "/groups/heartbeat"},
 		{name: "members", method: http.MethodPost, path: "/groups/members?group=analytics-workers"},
 	}
 
@@ -800,6 +917,15 @@ func leaveGroup(t *testing.T, handler http.Handler, groupName string, memberID s
 	t.Helper()
 
 	return performRequest(handler, http.MethodPost, "/groups/leave", groupMembershipRequest{
+		Group:    groupName,
+		MemberID: memberID,
+	})
+}
+
+func heartbeatGroup(t *testing.T, handler http.Handler, groupName string, memberID string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	return performRequest(handler, http.MethodPost, "/groups/heartbeat", groupMembershipRequest{
 		Group:    groupName,
 		MemberID: memberID,
 	})

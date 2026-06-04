@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"kairolog/internal/consumer"
 	"kairolog/internal/group"
@@ -150,6 +151,7 @@ func newServer(topicManager *topic.Manager, offsetStores ...*consumer.OffsetStor
 	mux.HandleFunc("/groups/assign", server.groupAssignHandler)
 	mux.HandleFunc("/groups/join", server.groupJoinHandler)
 	mux.HandleFunc("/groups/leave", server.groupLeaveHandler)
+	mux.HandleFunc("/groups/heartbeat", server.groupHeartbeatHandler)
 	mux.HandleFunc("/groups/members", server.groupMembersHandler)
 
 	return &http.Server{
@@ -513,6 +515,37 @@ func (s *Server) groupLeaveHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, groupMembershipResponse{Status: "left"})
+}
+
+func (s *Server) groupHeartbeatHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req groupMembershipRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	groupName, memberID, ok := parseMembershipRequest(req)
+	if !ok {
+		http.Error(w, "invalid group membership request", http.StatusBadRequest)
+		return
+	}
+
+	if s.registry == nil {
+		http.Error(w, "group registry is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.registry.Heartbeat(groupName, memberID, time.Now()); err != nil {
+		http.Error(w, "failed to record heartbeat", http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupMembershipResponse{Status: "heartbeat recorded"})
 }
 
 func (s *Server) groupMembersHandler(w http.ResponseWriter, r *http.Request) {
