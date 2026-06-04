@@ -5,10 +5,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 type GroupMember struct {
-	ID string
+	ID       string
+	LastSeen time.Time
 }
 
 type GroupState struct {
@@ -18,12 +20,12 @@ type GroupState struct {
 
 type Registry struct {
 	mu     sync.RWMutex
-	groups map[string]map[string]struct{}
+	groups map[string]map[string]time.Time
 }
 
 func NewRegistry() *Registry {
 	return &Registry{
-		groups: make(map[string]map[string]struct{}),
+		groups: make(map[string]map[string]time.Time),
 	}
 }
 
@@ -37,13 +39,38 @@ func (r *Registry) Join(group string, memberID string) error {
 	defer r.mu.Unlock()
 
 	if r.groups == nil {
-		r.groups = make(map[string]map[string]struct{})
+		r.groups = make(map[string]map[string]time.Time)
 	}
 	if _, exists := r.groups[group]; !exists {
-		r.groups[group] = make(map[string]struct{})
+		r.groups[group] = make(map[string]time.Time)
 	}
 
-	r.groups[group][memberID] = struct{}{}
+	if _, exists := r.groups[group][memberID]; !exists {
+		r.groups[group][memberID] = time.Now()
+	}
+	return nil
+}
+
+func (r *Registry) Heartbeat(group string, memberID string, now time.Time) error {
+	group, memberID, err := validateGroupMember(group, memberID)
+	if err != nil {
+		return err
+	}
+	if now.IsZero() {
+		return fmt.Errorf("heartbeat time cannot be zero")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.groups == nil {
+		r.groups = make(map[string]map[string]time.Time)
+	}
+	if _, exists := r.groups[group]; !exists {
+		r.groups[group] = make(map[string]time.Time)
+	}
+
+	r.groups[group][memberID] = now
 	return nil
 }
 
@@ -96,10 +123,13 @@ func (r *Registry) State(group string) (GroupState, error) {
 	}, nil
 }
 
-func sortedGroupMembers(memberSet map[string]struct{}) []GroupMember {
+func sortedGroupMembers(memberSet map[string]time.Time) []GroupMember {
 	members := make([]GroupMember, 0, len(memberSet))
-	for id := range memberSet {
-		members = append(members, GroupMember{ID: id})
+	for id, lastSeen := range memberSet {
+		members = append(members, GroupMember{
+			ID:       id,
+			LastSeen: lastSeen,
+		})
 	}
 
 	sort.Slice(members, func(i, j int) bool {
