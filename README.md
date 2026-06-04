@@ -17,6 +17,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 - Consumer group assignment endpoint (`POST /groups/assign`)
 - Consumer group join endpoint (`POST /groups/join`)
 - Consumer group leave endpoint (`POST /groups/leave`)
+- Consumer group heartbeat endpoint (`POST /groups/heartbeat`)
 - Consumer group members endpoint (`GET /groups/members`)
 - In-memory log component
 - File-based storage component
@@ -74,7 +75,7 @@ The group assignment engine distributes topic partitions across consumer group m
 
 The group membership registry tracks members joining and leaving consumer groups. The HTTP broker exposes this through `POST /groups/join`, `POST /groups/leave`, and `GET /groups/members`.
 
-The group registry also tracks `LastSeen` timestamps for members. A member receives a timestamp when it joins, and the internal heartbeat method can update that timestamp when the member is seen again.
+The group registry also tracks `LastSeen` timestamps for members. A member receives a timestamp when it joins, and the heartbeat endpoint updates that timestamp when the member is seen again.
 
 ## Storage Layout
 
@@ -340,6 +341,31 @@ Example response:
 }
 ```
 
+### Record Consumer Group Heartbeat
+
+```http
+POST /groups/heartbeat
+```
+
+Example request:
+
+```json
+{
+  "group": "analytics-workers",
+  "member_id": "member-a"
+}
+```
+
+Example response:
+
+```json
+{
+  "status": "heartbeat recorded"
+}
+```
+
+The heartbeat endpoint records that a group member was recently seen. Internally, it updates the member’s `LastSeen` timestamp. If the member does not already exist in the group, the heartbeat creates the member entry.
+
 ### List Consumer Group Members
 
 ```http
@@ -361,6 +387,8 @@ Example response:
   ]
 }
 ```
+
+The members endpoint currently returns member IDs only. `LastSeen` is tracked internally but is not exposed in this response yet.
 
 ## Consumer Group Assignment
 
@@ -399,9 +427,11 @@ Supported behavior:
 ```text
 member joins group
 member leaves group
+member heartbeat is recorded
 current members can be listed
 duplicate joins are idempotent
 leaving a missing member is idempotent
+heartbeat for a missing member creates the member
 ```
 
 Membership is currently in-memory only. It is not persisted yet.
@@ -426,7 +456,9 @@ Leave(group, memberID)
 → removes its LastSeen timestamp
 ```
 
-Heartbeat tracking is currently implemented inside the group registry. It is not exposed through the HTTP API yet.
+Heartbeat tracking is now implemented inside the group registry and exposed through `POST /groups/heartbeat`.
+
+Heartbeat tracking does not yet automatically remove stale members or trigger rebalancing.
 
 ## Running Tests
 
@@ -463,10 +495,10 @@ Completed core areas:
 - Consumer group membership registry
 - Consumer group membership endpoints
 - Internal heartbeat tracking foundation
+- Consumer group heartbeat endpoint
 
 Still planned:
 
-- HTTP heartbeat endpoint (`POST /groups/heartbeat`)
 - Stale member detection
 - Automatic group rebalancing behavior
 - Stronger crash recovery beyond missing-index rebuild
