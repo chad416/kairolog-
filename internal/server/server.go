@@ -119,6 +119,17 @@ type groupStaleResponse struct {
 	Members   []groupMemberResponse `json:"members"`
 }
 
+type groupRemoveStaleRequest struct {
+	Group     string `json:"group"`
+	TimeoutMS int64  `json:"timeout_ms"`
+}
+
+type groupRemoveStaleResponse struct {
+	Group          string                `json:"group"`
+	TimeoutMS      int64                 `json:"timeout_ms"`
+	RemovedMembers []groupMemberResponse `json:"removed_members"`
+}
+
 type groupMemberResponse struct {
 	ID string `json:"id"`
 }
@@ -167,6 +178,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/groups/heartbeat", s.groupHeartbeatHandler)
 	mux.HandleFunc("/groups/members", s.groupMembersHandler)
 	mux.HandleFunc("/groups/stale", s.groupStaleHandler)
+	mux.HandleFunc("/groups/remove-stale", s.groupRemoveStaleHandler)
 
 	return mux
 }
@@ -628,6 +640,47 @@ func (s *Server) groupStaleHandler(w http.ResponseWriter, r *http.Request) {
 		Group:     groupName,
 		TimeoutMS: timeoutMS,
 		Members:   convertGroupMembers(members),
+	})
+}
+
+func (s *Server) groupRemoveStaleHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req groupRemoveStaleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	groupName := strings.TrimSpace(req.Group)
+	if groupName == "" {
+		http.Error(w, "missing group", http.StatusBadRequest)
+		return
+	}
+	if req.TimeoutMS <= 0 {
+		http.Error(w, "invalid timeout", http.StatusBadRequest)
+		return
+	}
+
+	if s.registry == nil {
+		http.Error(w, "group registry is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	timeout := time.Duration(req.TimeoutMS) * time.Millisecond
+	removedMembers, err := s.registry.RemoveStaleMembers(groupName, time.Now(), timeout)
+	if err != nil {
+		http.Error(w, "failed to remove stale group members", http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupRemoveStaleResponse{
+		Group:          groupName,
+		TimeoutMS:      req.TimeoutMS,
+		RemovedMembers: convertGroupMembers(removedMembers),
 	})
 }
 

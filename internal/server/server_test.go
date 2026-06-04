@@ -773,6 +773,221 @@ func TestGroupStaleRejectsWrongMethod(t *testing.T) {
 	}
 }
 
+func TestGroupRemoveStaleRemovesStaleMembers(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-10*time.Minute))
+
+	response := removeStaleGroupMembers(t, srv.Handler, "analytics-workers", 300000)
+	expected := groupRemoveStaleResponse{
+		Group:          "analytics-workers",
+		TimeoutMS:      300000,
+		RemovedMembers: []groupMemberResponse{{ID: "member-a"}},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupRemoveStaleDoesNotRemoveActiveMembers(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-time.Second))
+
+	response := removeStaleGroupMembers(t, srv.Handler, "analytics-workers", 300000)
+	expected := groupRemoveStaleResponse{
+		Group:          "analytics-workers",
+		TimeoutMS:      300000,
+		RemovedMembers: []groupMemberResponse{},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+
+	members := getGroupMembers(t, srv.Handler, "analytics-workers")
+	expectedMembers := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{{ID: "member-a"}},
+	}
+
+	if !reflect.DeepEqual(members, expectedMembers) {
+		t.Fatalf("expected %v, got %v", expectedMembers, members)
+	}
+}
+
+func TestGroupRemoveStaleRemovesOnlyStaleMembers(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-time.Second))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", time.Now().Add(-10*time.Minute))
+
+	response := removeStaleGroupMembers(t, srv.Handler, "analytics-workers", 300000)
+	expected := groupRemoveStaleResponse{
+		Group:          "analytics-workers",
+		TimeoutMS:      300000,
+		RemovedMembers: []groupMemberResponse{{ID: "member-b"}},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupRemoveStaleRemovedMembersAreReturnedSorted(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+	staleTime := time.Now().Add(-10 * time.Minute)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-c", staleTime)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", staleTime)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", staleTime)
+
+	response := removeStaleGroupMembers(t, srv.Handler, "analytics-workers", 300000)
+	expected := groupRemoveStaleResponse{
+		Group:     "analytics-workers",
+		TimeoutMS: 300000,
+		RemovedMembers: []groupMemberResponse{
+			{ID: "member-a"},
+			{ID: "member-b"},
+			{ID: "member-c"},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupRemoveStaleRemovedMembersNoLongerAppear(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-10*time.Minute))
+
+	removeStaleGroupMembers(t, srv.Handler, "analytics-workers", 300000)
+
+	members := getGroupMembers(t, srv.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupRemoveStaleActiveMembersRemain(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-10*time.Minute))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", time.Now().Add(-time.Second))
+
+	removeStaleGroupMembers(t, srv.Handler, "analytics-workers", 300000)
+
+	members := getGroupMembers(t, srv.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{{ID: "member-b"}},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupRemoveStaleMissingGroupReturnsEmptyRemovedMembers(t *testing.T) {
+	srv, _ := newTestServerWithRegistry(t)
+
+	response := removeStaleGroupMembers(t, srv.Handler, "missing-workers", 300000)
+	expected := groupRemoveStaleResponse{
+		Group:          "missing-workers",
+		TimeoutMS:      300000,
+		RemovedMembers: []groupMemberResponse{},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupRemoveStaleRejectsInvalidBody(t *testing.T) {
+	srv := newTestServer(t)
+
+	tests := []struct {
+		name string
+		body interface{}
+	}{
+		{
+			name: "missing group",
+			body: map[string]interface{}{
+				"timeout_ms": 300000,
+			},
+		},
+		{
+			name: "empty group",
+			body: groupRemoveStaleRequest{
+				Group:     "",
+				TimeoutMS: 300000,
+			},
+		},
+		{
+			name: "missing timeout",
+			body: map[string]interface{}{
+				"group": "analytics-workers",
+			},
+		},
+		{
+			name: "zero timeout",
+			body: groupRemoveStaleRequest{
+				Group:     "analytics-workers",
+				TimeoutMS: 0,
+			},
+		},
+		{
+			name: "negative timeout",
+			body: groupRemoveStaleRequest{
+				Group:     "analytics-workers",
+				TimeoutMS: -1,
+			},
+		},
+		{
+			name: "invalid timeout",
+			body: map[string]interface{}{
+				"group":      "analytics-workers",
+				"timeout_ms": "invalid",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := performRequest(srv.Handler, http.MethodPost, "/groups/remove-stale", tt.body)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestGroupRemoveStaleRejectsInvalidJSON(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRawRequest(srv.Handler, http.MethodPost, "/groups/remove-stale", "{")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
+func TestGroupRemoveStaleRejectsWrongMethod(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRequest(srv.Handler, http.MethodGet, "/groups/remove-stale", nil)
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected status %d, got %d", http.StatusMethodNotAllowed, recorder.Code)
+	}
+}
+
 func TestGroupMembersAreReturnedSorted(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -939,6 +1154,7 @@ func TestGroupMembershipRejectsWrongMethods(t *testing.T) {
 		{name: "heartbeat", method: http.MethodGet, path: "/groups/heartbeat"},
 		{name: "members", method: http.MethodPost, path: "/groups/members?group=analytics-workers"},
 		{name: "stale", method: http.MethodPost, path: "/groups/stale?group=analytics-workers&timeout_ms=300000"},
+		{name: "remove stale", method: http.MethodGet, path: "/groups/remove-stale"},
 	}
 
 	for _, tt := range tests {
@@ -1108,6 +1324,23 @@ func getStaleGroupMembers(t *testing.T, handler http.Handler, path string) group
 	}
 
 	var response groupStaleResponse
+	decodeJSON(t, recorder, &response)
+
+	return response
+}
+
+func removeStaleGroupMembers(t *testing.T, handler http.Handler, groupName string, timeoutMS int64) groupRemoveStaleResponse {
+	t.Helper()
+
+	recorder := performRequest(handler, http.MethodPost, "/groups/remove-stale", groupRemoveStaleRequest{
+		Group:     groupName,
+		TimeoutMS: timeoutMS,
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupRemoveStaleResponse
 	decodeJSON(t, recorder, &response)
 
 	return response
