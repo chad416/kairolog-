@@ -123,6 +123,32 @@ func (r *Registry) State(group string) (GroupState, error) {
 	}, nil
 }
 
+func (r *Registry) StaleMembers(group string, now time.Time, timeout time.Duration) ([]GroupMember, error) {
+	group, err := validateGroup(group)
+	if err != nil {
+		return nil, err
+	}
+	if now.IsZero() {
+		return nil, fmt.Errorf("now time cannot be zero")
+	}
+	if timeout <= 0 {
+		return nil, fmt.Errorf("timeout must be positive")
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	members := sortedGroupMembers(r.groups[group])
+	staleMembers := make([]GroupMember, 0, len(members))
+	for _, member := range members {
+		if now.Sub(member.LastSeen) > timeout {
+			staleMembers = append(staleMembers, member)
+		}
+	}
+
+	return staleMembers, nil
+}
+
 func sortedGroupMembers(memberSet map[string]time.Time) []GroupMember {
 	members := make([]GroupMember, 0, len(memberSet))
 	for id, lastSeen := range memberSet {
