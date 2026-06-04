@@ -113,6 +113,12 @@ type groupMembersResponse struct {
 	Members []groupMemberResponse `json:"members"`
 }
 
+type groupStaleResponse struct {
+	Group     string                `json:"group"`
+	TimeoutMS int64                 `json:"timeout_ms"`
+	Members   []groupMemberResponse `json:"members"`
+}
+
 type groupMemberResponse struct {
 	ID string `json:"id"`
 }
@@ -141,23 +147,28 @@ func newServer(topicManager *topic.Manager, offsetStores ...*consumer.OffsetStor
 		registry:     group.NewRegistry(),
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", server.healthHandler)
-	mux.HandleFunc("/topics", server.topicsHandler)
-	mux.HandleFunc("/produce", server.produceHandler)
-	mux.HandleFunc("/fetch", server.fetchHandler)
-	mux.HandleFunc("/offsets/commit", server.offsetCommitHandler)
-	mux.HandleFunc("/offsets", server.offsetsHandler)
-	mux.HandleFunc("/groups/assign", server.groupAssignHandler)
-	mux.HandleFunc("/groups/join", server.groupJoinHandler)
-	mux.HandleFunc("/groups/leave", server.groupLeaveHandler)
-	mux.HandleFunc("/groups/heartbeat", server.groupHeartbeatHandler)
-	mux.HandleFunc("/groups/members", server.groupMembersHandler)
-
 	return &http.Server{
 		Addr:    defaultAddr,
-		Handler: mux,
+		Handler: server.routes(),
 	}
+}
+
+func (s *Server) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", s.healthHandler)
+	mux.HandleFunc("/topics", s.topicsHandler)
+	mux.HandleFunc("/produce", s.produceHandler)
+	mux.HandleFunc("/fetch", s.fetchHandler)
+	mux.HandleFunc("/offsets/commit", s.offsetCommitHandler)
+	mux.HandleFunc("/offsets", s.offsetsHandler)
+	mux.HandleFunc("/groups/assign", s.groupAssignHandler)
+	mux.HandleFunc("/groups/join", s.groupJoinHandler)
+	mux.HandleFunc("/groups/leave", s.groupLeaveHandler)
+	mux.HandleFunc("/groups/heartbeat", s.groupHeartbeatHandler)
+	mux.HandleFunc("/groups/members", s.groupMembersHandler)
+	mux.HandleFunc("/groups/stale", s.groupStaleHandler)
+
+	return mux
 }
 
 func Start() error {
@@ -574,6 +585,49 @@ func (s *Server) groupMembersHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, groupMembersResponse{
 		Group:   groupName,
 		Members: convertGroupMembers(members),
+	})
+}
+
+func (s *Server) groupStaleHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	groupName := strings.TrimSpace(r.URL.Query().Get("group"))
+	if groupName == "" {
+		http.Error(w, "missing group", http.StatusBadRequest)
+		return
+	}
+
+	timeoutValue := r.URL.Query().Get("timeout_ms")
+	if timeoutValue == "" {
+		http.Error(w, "missing timeout", http.StatusBadRequest)
+		return
+	}
+
+	timeoutMS, err := strconv.ParseInt(timeoutValue, 10, 64)
+	if err != nil || timeoutMS <= 0 {
+		http.Error(w, "invalid timeout", http.StatusBadRequest)
+		return
+	}
+
+	if s.registry == nil {
+		http.Error(w, "group registry is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	timeout := time.Duration(timeoutMS) * time.Millisecond
+	members, err := s.registry.StaleMembers(groupName, time.Now(), timeout)
+	if err != nil {
+		http.Error(w, "failed to get stale group members", http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupStaleResponse{
+		Group:     groupName,
+		TimeoutMS: timeoutMS,
+		Members:   convertGroupMembers(members),
 	})
 }
 

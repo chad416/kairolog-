@@ -8,6 +8,11 @@ import (
 	"os"
 	"reflect"
 	"testing"
+	"time"
+
+	"kairolog/internal/consumer"
+	"kairolog/internal/group"
+	"kairolog/internal/topic"
 )
 
 func TestHealth(t *testing.T) {
@@ -643,6 +648,131 @@ func TestGroupHeartbeatRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestGroupStaleReturnsStaleMembers(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-10*time.Minute))
+
+	response := getStaleGroupMembers(t, srv.Handler, "/groups/stale?group=analytics-workers&timeout_ms=300000")
+	expected := groupStaleResponse{
+		Group:     "analytics-workers",
+		TimeoutMS: 300000,
+		Members:   []groupMemberResponse{{ID: "member-a"}},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupStaleDoesNotReturnActiveMembers(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-time.Second))
+
+	response := getStaleGroupMembers(t, srv.Handler, "/groups/stale?group=analytics-workers&timeout_ms=300000")
+	expected := groupStaleResponse{
+		Group:     "analytics-workers",
+		TimeoutMS: 300000,
+		Members:   []groupMemberResponse{},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupStaleReturnsOnlyStaleMembers(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-time.Second))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", time.Now().Add(-10*time.Minute))
+
+	response := getStaleGroupMembers(t, srv.Handler, "/groups/stale?group=analytics-workers&timeout_ms=300000")
+	expected := groupStaleResponse{
+		Group:     "analytics-workers",
+		TimeoutMS: 300000,
+		Members:   []groupMemberResponse{{ID: "member-b"}},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupStaleMembersAreReturnedSorted(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+	staleTime := time.Now().Add(-10 * time.Minute)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-c", staleTime)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", staleTime)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", staleTime)
+
+	response := getStaleGroupMembers(t, srv.Handler, "/groups/stale?group=analytics-workers&timeout_ms=300000")
+	expected := groupStaleResponse{
+		Group:     "analytics-workers",
+		TimeoutMS: 300000,
+		Members: []groupMemberResponse{
+			{ID: "member-a"},
+			{ID: "member-b"},
+			{ID: "member-c"},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupStaleMissingGroupReturnsEmptyMembers(t *testing.T) {
+	srv, _ := newTestServerWithRegistry(t)
+
+	response := getStaleGroupMembers(t, srv.Handler, "/groups/stale?group=missing-workers&timeout_ms=300000")
+	expected := groupStaleResponse{
+		Group:     "missing-workers",
+		TimeoutMS: 300000,
+		Members:   []groupMemberResponse{},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupStaleRejectsInvalidQuery(t *testing.T) {
+	srv := newTestServer(t)
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "missing group", path: "/groups/stale?timeout_ms=300000"},
+		{name: "empty group", path: "/groups/stale?group=&timeout_ms=300000"},
+		{name: "missing timeout", path: "/groups/stale?group=analytics-workers"},
+		{name: "invalid timeout", path: "/groups/stale?group=analytics-workers&timeout_ms=invalid"},
+		{name: "zero timeout", path: "/groups/stale?group=analytics-workers&timeout_ms=0"},
+		{name: "negative timeout", path: "/groups/stale?group=analytics-workers&timeout_ms=-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := performRequest(srv.Handler, http.MethodGet, tt.path, nil)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestGroupStaleRejectsWrongMethod(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRequest(srv.Handler, http.MethodPost, "/groups/stale?group=analytics-workers&timeout_ms=300000", nil)
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected status %d, got %d", http.StatusMethodNotAllowed, recorder.Code)
+	}
+}
+
 func TestGroupMembersAreReturnedSorted(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -808,6 +938,7 @@ func TestGroupMembershipRejectsWrongMethods(t *testing.T) {
 		{name: "leave", method: http.MethodGet, path: "/groups/leave"},
 		{name: "heartbeat", method: http.MethodGet, path: "/groups/heartbeat"},
 		{name: "members", method: http.MethodPost, path: "/groups/members?group=analytics-workers"},
+		{name: "stale", method: http.MethodPost, path: "/groups/stale?group=analytics-workers&timeout_ms=300000"},
 	}
 
 	for _, tt := range tests {
@@ -830,6 +961,29 @@ func newTestServer(t *testing.T) *http.Server {
 	}
 
 	return srv
+}
+
+func newTestServerWithRegistry(t *testing.T) (*http.Server, *group.Registry) {
+	t.Helper()
+	chdirTemp(t)
+
+	offsetStore, err := consumer.NewOffsetStore(defaultOffsetStorePath)
+	if err != nil {
+		t.Fatalf("failed to create offset store: %v", err)
+	}
+
+	registry := group.NewRegistry()
+	server := &Server{
+		topicManager: topic.NewManager(),
+		offsetStore:  offsetStore,
+		assigner:     group.NewAssigner(),
+		registry:     registry,
+	}
+
+	return &http.Server{
+		Addr:    defaultAddr,
+		Handler: server.routes(),
+	}, registry
 }
 
 func createTopic(t *testing.T, handler http.Handler, name string, partitions int) *httptest.ResponseRecorder {
@@ -943,6 +1097,28 @@ func getGroupMembers(t *testing.T, handler http.Handler, groupName string) group
 	decodeJSON(t, recorder, &response)
 
 	return response
+}
+
+func getStaleGroupMembers(t *testing.T, handler http.Handler, path string) groupStaleResponse {
+	t.Helper()
+
+	recorder := performRequest(handler, http.MethodGet, path, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupStaleResponse
+	decodeJSON(t, recorder, &response)
+
+	return response
+}
+
+func recordRegistryHeartbeat(t *testing.T, registry *group.Registry, groupName string, memberID string, lastSeen time.Time) {
+	t.Helper()
+
+	if err := registry.Heartbeat(groupName, memberID, lastSeen); err != nil {
+		t.Fatalf("failed to record registry heartbeat: %v", err)
+	}
 }
 
 func performRequest(handler http.Handler, method string, path string, body interface{}) *httptest.ResponseRecorder {
