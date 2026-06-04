@@ -149,6 +149,37 @@ func (r *Registry) StaleMembers(group string, now time.Time, timeout time.Durati
 	return staleMembers, nil
 }
 
+func (r *Registry) RemoveStaleMembers(group string, now time.Time, timeout time.Duration) ([]GroupMember, error) {
+	group, err := validateGroup(group)
+	if err != nil {
+		return nil, err
+	}
+	if now.IsZero() {
+		return nil, fmt.Errorf("now time cannot be zero")
+	}
+	if timeout <= 0 {
+		return nil, fmt.Errorf("timeout must be positive")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	members := r.groups[group]
+	removedMembers := make([]GroupMember, 0, len(members))
+	for _, member := range sortedGroupMembers(members) {
+		if now.Sub(member.LastSeen) > timeout {
+			removedMembers = append(removedMembers, member)
+			delete(members, member.ID)
+		}
+	}
+
+	if len(members) == 0 {
+		delete(r.groups, group)
+	}
+
+	return removedMembers, nil
+}
+
 func sortedGroupMembers(memberSet map[string]time.Time) []GroupMember {
 	members := make([]GroupMember, 0, len(memberSet))
 	for id, lastSeen := range memberSet {

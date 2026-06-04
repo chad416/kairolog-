@@ -334,6 +334,204 @@ func TestRegistryStaleMembersRejectsNegativeTimeout(t *testing.T) {
 	}
 }
 
+func TestRegistryRemoveStaleMembersRemovesAndReturnsStaleMember(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+	lastSeen := now.Add(-6 * time.Minute)
+
+	if err := registry.Heartbeat("analytics-workers", "member-a", lastSeen); err != nil {
+		t.Fatalf("failed to heartbeat member: %v", err)
+	}
+
+	removedMembers := mustRemoveStaleMembers(t, registry, "analytics-workers", now, 5*time.Minute)
+	expected := []GroupMember{
+		{ID: "member-a", LastSeen: lastSeen},
+	}
+
+	if !reflect.DeepEqual(removedMembers, expected) {
+		t.Fatalf("expected %v, got %v", expected, removedMembers)
+	}
+}
+
+func TestRegistryRemoveStaleMembersDoesNotRemoveActiveMember(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+	activeSeen := now.Add(-5 * time.Minute)
+
+	if err := registry.Heartbeat("analytics-workers", "member-a", activeSeen); err != nil {
+		t.Fatalf("failed to heartbeat member: %v", err)
+	}
+
+	removedMembers := mustRemoveStaleMembers(t, registry, "analytics-workers", now, 5*time.Minute)
+	if len(removedMembers) != 0 {
+		t.Fatalf("expected no removed members, got %v", removedMembers)
+	}
+
+	members := mustMembers(t, registry, "analytics-workers")
+	expected := []GroupMember{
+		{ID: "member-a", LastSeen: activeSeen},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestRegistryRemoveStaleMembersRemovesOnlyStaleMembers(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+	staleSeen := now.Add(-6 * time.Minute)
+	activeSeen := now.Add(-4 * time.Minute)
+
+	heartbeatMembers(t, registry, "analytics-workers", map[string]time.Time{
+		"member-a": activeSeen,
+		"member-b": staleSeen,
+	})
+
+	removedMembers := mustRemoveStaleMembers(t, registry, "analytics-workers", now, 5*time.Minute)
+	expectedRemoved := []GroupMember{
+		{ID: "member-b", LastSeen: staleSeen},
+	}
+
+	if !reflect.DeepEqual(removedMembers, expectedRemoved) {
+		t.Fatalf("expected %v, got %v", expectedRemoved, removedMembers)
+	}
+
+	remainingMembers := mustMembers(t, registry, "analytics-workers")
+	expectedRemaining := []GroupMember{
+		{ID: "member-a", LastSeen: activeSeen},
+	}
+
+	if !reflect.DeepEqual(remainingMembers, expectedRemaining) {
+		t.Fatalf("expected %v, got %v", expectedRemaining, remainingMembers)
+	}
+}
+
+func TestRegistryRemoveStaleMembersReturnsRemovedMembersSorted(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+	t1 := now.Add(-8 * time.Minute)
+	t2 := now.Add(-7 * time.Minute)
+	t3 := now.Add(-6 * time.Minute)
+
+	heartbeatMembers(t, registry, "analytics-workers", map[string]time.Time{
+		"member-c": t3,
+		"member-a": t1,
+		"member-b": t2,
+	})
+
+	removedMembers := mustRemoveStaleMembers(t, registry, "analytics-workers", now, 5*time.Minute)
+	expected := []GroupMember{
+		{ID: "member-a", LastSeen: t1},
+		{ID: "member-b", LastSeen: t2},
+		{ID: "member-c", LastSeen: t3},
+	}
+
+	if !reflect.DeepEqual(removedMembers, expected) {
+		t.Fatalf("expected %v, got %v", expected, removedMembers)
+	}
+}
+
+func TestRegistryRemoveStaleMembersRemovedMembersNoLongerAppear(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	if err := registry.Heartbeat("analytics-workers", "member-a", now.Add(-6*time.Minute)); err != nil {
+		t.Fatalf("failed to heartbeat member: %v", err)
+	}
+
+	mustRemoveStaleMembers(t, registry, "analytics-workers", now, 5*time.Minute)
+
+	members := mustMembers(t, registry, "analytics-workers")
+	if len(members) != 0 {
+		t.Fatalf("expected no members, got %v", members)
+	}
+}
+
+func TestRegistryRemoveStaleMembersActiveMembersRemain(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+	staleSeen := now.Add(-6 * time.Minute)
+	activeSeen := now.Add(-4 * time.Minute)
+
+	heartbeatMembers(t, registry, "analytics-workers", map[string]time.Time{
+		"member-a": staleSeen,
+		"member-b": activeSeen,
+	})
+
+	mustRemoveStaleMembers(t, registry, "analytics-workers", now, 5*time.Minute)
+
+	members := mustMembers(t, registry, "analytics-workers")
+	expected := []GroupMember{
+		{ID: "member-b", LastSeen: activeSeen},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestRegistryRemoveStaleMembersRemovesGroupWhenAllMembersAreStale(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	heartbeatMembers(t, registry, "analytics-workers", map[string]time.Time{
+		"member-a": now.Add(-6 * time.Minute),
+		"member-b": now.Add(-7 * time.Minute),
+	})
+
+	mustRemoveStaleMembers(t, registry, "analytics-workers", now, 5*time.Minute)
+
+	if _, exists := registry.groups["analytics-workers"]; exists {
+		t.Fatalf("expected group entry to be removed")
+	}
+}
+
+func TestRegistryRemoveStaleMembersMissingGroupReturnsEmptySlice(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	removedMembers := mustRemoveStaleMembers(t, registry, "missing-workers", now, 5*time.Minute)
+	if len(removedMembers) != 0 {
+		t.Fatalf("expected no removed members, got %v", removedMembers)
+	}
+}
+
+func TestRegistryRemoveStaleMembersRejectsEmptyGroup(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	if _, err := registry.RemoveStaleMembers("", now, 5*time.Minute); err == nil {
+		t.Fatalf("expected remove stale members to reject empty group")
+	}
+}
+
+func TestRegistryRemoveStaleMembersRejectsZeroNow(t *testing.T) {
+	registry := NewRegistry()
+
+	if _, err := registry.RemoveStaleMembers("analytics-workers", time.Time{}, 5*time.Minute); err == nil {
+		t.Fatalf("expected remove stale members to reject zero now time")
+	}
+}
+
+func TestRegistryRemoveStaleMembersRejectsZeroTimeout(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	if _, err := registry.RemoveStaleMembers("analytics-workers", now, 0); err == nil {
+		t.Fatalf("expected remove stale members to reject zero timeout")
+	}
+}
+
+func TestRegistryRemoveStaleMembersRejectsNegativeTimeout(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	if _, err := registry.RemoveStaleMembers("analytics-workers", now, -time.Minute); err == nil {
+		t.Fatalf("expected remove stale members to reject negative timeout")
+	}
+}
+
 func TestRegistryRejectsEmptyGroup(t *testing.T) {
 	registry := NewRegistry()
 	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
@@ -355,6 +553,9 @@ func TestRegistryRejectsEmptyGroup(t *testing.T) {
 	}
 	if _, err := registry.StaleMembers("", now, time.Minute); err == nil {
 		t.Fatalf("expected stale members to reject empty group")
+	}
+	if _, err := registry.RemoveStaleMembers("", now, time.Minute); err == nil {
+		t.Fatalf("expected remove stale members to reject empty group")
 	}
 }
 
@@ -398,6 +599,17 @@ func mustStaleMembers(t *testing.T, registry *Registry, group string, now time.T
 	members, err := registry.StaleMembers(group, now, timeout)
 	if err != nil {
 		t.Fatalf("failed to get stale members: %v", err)
+	}
+
+	return members
+}
+
+func mustRemoveStaleMembers(t *testing.T, registry *Registry, group string, now time.Time, timeout time.Duration) []GroupMember {
+	t.Helper()
+
+	members, err := registry.RemoveStaleMembers(group, now, timeout)
+	if err != nil {
+		t.Fatalf("failed to remove stale members: %v", err)
 	}
 
 	return members
