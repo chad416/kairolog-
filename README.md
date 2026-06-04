@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, and stale member detection.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, and stale member removal.
 
 ## Current Features
 
@@ -43,6 +43,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 - Last-seen timestamp tracking for group members
 - Internal stale group member detection
 - HTTP stale group member lookup
+- Internal stale group member removal
 - Topic manager
 - Partition manager
 - Topic partitions wired to partition logs
@@ -63,6 +64,7 @@ server
 → group membership registry
 → heartbeat tracking
 → stale member detection
+→ stale member removal
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -81,9 +83,9 @@ The group membership registry tracks members joining and leaving consumer groups
 
 The group registry tracks `LastSeen` timestamps for members. A member receives a timestamp when it joins, and the heartbeat endpoint updates that timestamp when the member is seen again.
 
-The group registry can detect stale members by comparing each member’s `LastSeen` timestamp against a timeout window. The HTTP broker exposes this through `GET /groups/stale`.
+The group registry can detect stale members by comparing each member’s `LastSeen` timestamp against a timeout window. The HTTP broker exposes detection through `GET /groups/stale`.
 
-Stale detection currently only reports stale members. It does not automatically remove members or trigger rebalancing yet.
+The group registry can also remove stale members internally. Removal is currently not exposed through HTTP and does not trigger automatic rebalancing yet.
 
 ## Storage Layout
 
@@ -108,7 +110,7 @@ Index files store offset-to-byte-position mappings.
 
 The consumer offset file stores committed offsets for consumer groups.
 
-Current group membership, heartbeat state, and stale-member detection state are in-memory only and are not persisted yet.
+Current group membership, heartbeat state, stale-member detection, and stale-member removal state are in-memory only and are not persisted yet.
 
 ## API
 
@@ -470,6 +472,7 @@ member leaves group
 member heartbeat is recorded
 current members can be listed
 stale members can be detected
+stale members can be removed internally
 duplicate joins are idempotent
 leaving a missing member is idempotent
 heartbeat for a missing member creates the member
@@ -499,7 +502,7 @@ Leave(group, memberID)
 
 Heartbeat tracking is implemented inside the group registry and exposed through `POST /groups/heartbeat`.
 
-Heartbeat tracking does not yet automatically remove stale members or trigger rebalancing.
+Heartbeat tracking does not yet automatically trigger rebalancing.
 
 ## Stale Member Detection
 
@@ -534,7 +537,42 @@ member-c
 
 Stale member detection is implemented inside the group registry and exposed through `GET /groups/stale`.
 
-Stale detection does not remove stale members, persist stale state, or trigger automatic rebalancing yet.
+## Stale Member Removal
+
+The group registry can remove stale members using the same timeout rule.
+
+Current behavior:
+
+```text
+RemoveStaleMembers(group, now, timeout)
+→ checks all members in the group
+→ removes members where now - LastSeen > timeout
+→ returns removed members sorted by member ID
+→ keeps active members in the group
+→ removes the group entry if all members are removed
+```
+
+Example:
+
+```text
+now: 12:00
+timeout: 5 minutes
+
+member-a LastSeen: 11:54 → removed
+member-b LastSeen: 11:57 → kept
+member-c LastSeen: 11:50 → removed
+```
+
+Result:
+
+```text
+removed: member-a, member-c
+remaining: member-b
+```
+
+Stale member removal is currently internal only. It is not exposed through HTTP yet.
+
+Stale member removal does not persist group state or trigger automatic rebalancing yet.
 
 ## Running Tests
 
@@ -574,10 +612,11 @@ Completed core areas:
 - Consumer group heartbeat endpoint
 - Internal stale member detection
 - Stale group members endpoint
+- Internal stale member removal
 
 Still planned:
 
-- Automatic stale member removal
+- HTTP stale member removal endpoint
 - Automatic group rebalancing behavior
 - Stronger crash recovery beyond missing-index rebuild
 - Persistent group membership and heartbeat state
