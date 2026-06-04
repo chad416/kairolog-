@@ -19,6 +19,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 - Consumer group leave endpoint (`POST /groups/leave`)
 - Consumer group heartbeat endpoint (`POST /groups/heartbeat`)
 - Consumer group members endpoint (`GET /groups/members`)
+- Stale group members endpoint (`GET /groups/stale`)
 - In-memory log component
 - File-based storage component
 - Offset-aware records
@@ -41,6 +42,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 - Group member heartbeat tracking
 - Last-seen timestamp tracking for group members
 - Internal stale group member detection
+- HTTP stale group member lookup
 - Topic manager
 - Partition manager
 - Topic partitions wired to partition logs
@@ -77,9 +79,11 @@ The group assignment engine distributes topic partitions across consumer group m
 
 The group membership registry tracks members joining and leaving consumer groups. The HTTP broker exposes this through `POST /groups/join`, `POST /groups/leave`, and `GET /groups/members`.
 
-The group registry also tracks `LastSeen` timestamps for members. A member receives a timestamp when it joins, and the heartbeat endpoint updates that timestamp when the member is seen again.
+The group registry tracks `LastSeen` timestamps for members. A member receives a timestamp when it joins, and the heartbeat endpoint updates that timestamp when the member is seen again.
 
-The group registry can detect stale members by comparing each member’s `LastSeen` timestamp against a timeout window. Stale detection is currently internal only and does not automatically remove members or trigger rebalancing.
+The group registry can detect stale members by comparing each member’s `LastSeen` timestamp against a timeout window. The HTTP broker exposes this through `GET /groups/stale`.
+
+Stale detection currently only reports stale members. It does not automatically remove members or trigger rebalancing yet.
 
 ## Storage Layout
 
@@ -394,6 +398,38 @@ Example response:
 
 The members endpoint currently returns member IDs only. `LastSeen` is tracked internally but is not exposed in this response yet.
 
+### List Stale Consumer Group Members
+
+```http
+GET /groups/stale?group=analytics-workers&timeout_ms=300000
+```
+
+Example response:
+
+```json
+{
+  "group": "analytics-workers",
+  "timeout_ms": 300000,
+  "members": [
+    {
+      "id": "member-a"
+    }
+  ]
+}
+```
+
+The stale members endpoint checks which members have not been seen within the requested timeout window.
+
+A member is considered stale when:
+
+```text
+now - LastSeen > timeout
+```
+
+The endpoint currently returns member IDs only. `LastSeen` is still tracked internally but is not exposed in this response yet.
+
+If the group does not exist, the endpoint returns an empty members array.
+
 ## Consumer Group Assignment
 
 The group assignment engine distributes partitions across members.
@@ -433,6 +469,7 @@ member joins group
 member leaves group
 member heartbeat is recorded
 current members can be listed
+stale members can be detected
 duplicate joins are idempotent
 leaving a missing member is idempotent
 heartbeat for a missing member creates the member
@@ -495,7 +532,9 @@ member-a
 member-c
 ```
 
-Stale member detection is currently internal only. It does not remove stale members, persist stale state, or trigger automatic rebalancing yet.
+Stale member detection is implemented inside the group registry and exposed through `GET /groups/stale`.
+
+Stale detection does not remove stale members, persist stale state, or trigger automatic rebalancing yet.
 
 ## Running Tests
 
@@ -534,10 +573,11 @@ Completed core areas:
 - Internal heartbeat tracking foundation
 - Consumer group heartbeat endpoint
 - Internal stale member detection
+- Stale group members endpoint
 
 Still planned:
 
-- HTTP stale member endpoint (`GET /groups/stale`)
+- Automatic stale member removal
 - Automatic group rebalancing behavior
 - Stronger crash recovery beyond missing-index rebuild
 - Persistent group membership and heartbeat state
