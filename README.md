@@ -6,48 +6,50 @@ The current focus is the single-node broker and storage foundation: topics, part
 
 ## Current Features
 
-- HTTP broker server
-- Health check endpoint (`GET /health`)
-- Topic creation endpoint (`POST /topics`)
-- Topic listing endpoint (`GET /topics`)
-- Topic-aware produce endpoint (`POST /produce`)
-- Topic/partition-aware fetch endpoint (`GET /fetch`)
-- Consumer offset commit endpoint (`POST /offsets/commit`)
-- Consumer offset lookup endpoint (`GET /offsets`)
-- Consumer group assignment endpoint (`POST /groups/assign`)
-- Consumer group join endpoint (`POST /groups/join`)
-- Consumer group leave endpoint (`POST /groups/leave`)
-- Consumer group heartbeat endpoint (`POST /groups/heartbeat`)
-- Consumer group members endpoint (`GET /groups/members`)
-- Stale group members endpoint (`GET /groups/stale`)
-- In-memory log component
-- File-based storage component
-- Offset-aware records
-- Segment file abstraction
-- Index file abstraction with real byte positions
-- Index-backed reads
-- Partition log abstraction
-- Basic segment rotation
-- Multiple segment/index pairs per partition
-- Reopen support for rotated segment/index pairs
-- Basic crash recovery for partition logs
-- Missing index-file rebuild from existing segment logs
-- Recovery of offset-to-byte-position mappings
-- Consumer offset store
-- Persistent consumer offset commits
-- Consumer group assignment engine
-- Deterministic balanced partition assignment
-- Consumer group membership registry
-- Join/leave group membership lifecycle
-- Group member heartbeat tracking
-- Last-seen timestamp tracking for group members
-- Internal stale group member detection
-- HTTP stale group member lookup
-- Internal stale group member removal
-- Topic manager
-- Partition manager
-- Topic partitions wired to partition logs
-- Unit tests for log, storage, topic, server, segment, index, partition, consumer, and group packages
+* HTTP broker server
+* Health check endpoint (`GET /health`)
+* Topic creation endpoint (`POST /topics`)
+* Topic listing endpoint (`GET /topics`)
+* Topic-aware produce endpoint (`POST /produce`)
+* Topic/partition-aware fetch endpoint (`GET /fetch`)
+* Consumer offset commit endpoint (`POST /offsets/commit`)
+* Consumer offset lookup endpoint (`GET /offsets`)
+* Consumer group assignment endpoint (`POST /groups/assign`)
+* Consumer group join endpoint (`POST /groups/join`)
+* Consumer group leave endpoint (`POST /groups/leave`)
+* Consumer group heartbeat endpoint (`POST /groups/heartbeat`)
+* Consumer group members endpoint (`GET /groups/members`)
+* Stale group members endpoint (`GET /groups/stale`)
+* Stale group member removal endpoint (`POST /groups/remove-stale`)
+* In-memory log component
+* File-based storage component
+* Offset-aware records
+* Segment file abstraction
+* Index file abstraction with real byte positions
+* Index-backed reads
+* Partition log abstraction
+* Basic segment rotation
+* Multiple segment/index pairs per partition
+* Reopen support for rotated segment/index pairs
+* Basic crash recovery for partition logs
+* Missing index-file rebuild from existing segment logs
+* Recovery of offset-to-byte-position mappings
+* Consumer offset store
+* Persistent consumer offset commits
+* Consumer group assignment engine
+* Deterministic balanced partition assignment
+* Consumer group membership registry
+* Join/leave group membership lifecycle
+* Group member heartbeat tracking
+* Last-seen timestamp tracking for group members
+* Internal stale group member detection
+* HTTP stale group member lookup
+* Internal stale group member removal
+* HTTP stale group member removal
+* Topic manager
+* Partition manager
+* Topic partitions wired to partition logs
+* Unit tests for log, storage, topic, server, segment, index, partition, consumer, and group packages
 
 ## Current Architecture
 
@@ -85,7 +87,9 @@ The group registry tracks `LastSeen` timestamps for members. A member receives a
 
 The group registry can detect stale members by comparing each member’s `LastSeen` timestamp against a timeout window. The HTTP broker exposes detection through `GET /groups/stale`.
 
-The group registry can also remove stale members internally. Removal is currently not exposed through HTTP and does not trigger automatic rebalancing yet.
+The group registry can also remove stale members. The HTTP broker exposes stale-member removal through `POST /groups/remove-stale`.
+
+Stale-member removal currently removes members from the in-memory registry only. It does not automatically trigger partition reassignment or rebalance yet.
 
 ## Storage Layout
 
@@ -432,6 +436,49 @@ The endpoint currently returns member IDs only. `LastSeen` is still tracked inte
 
 If the group does not exist, the endpoint returns an empty members array.
 
+### Remove Stale Consumer Group Members
+
+```http
+POST /groups/remove-stale
+```
+
+Example request:
+
+```json
+{
+  "group": "analytics-workers",
+  "timeout_ms": 300000
+}
+```
+
+Example response:
+
+```json
+{
+  "group": "analytics-workers",
+  "timeout_ms": 300000,
+  "removed_members": [
+    {
+      "id": "member-a"
+    }
+  ]
+}
+```
+
+The stale-member removal endpoint removes members that have not been seen within the requested timeout window.
+
+A member is removed when:
+
+```text
+now - LastSeen > timeout
+```
+
+The endpoint currently returns removed member IDs only. `LastSeen` is still tracked internally but is not exposed in this response yet.
+
+If the group does not exist, the endpoint returns an empty `removed_members` array.
+
+This endpoint removes stale members from the in-memory group registry. It does not trigger automatic partition reassignment or rebalancing yet.
+
 ## Consumer Group Assignment
 
 The group assignment engine distributes partitions across members.
@@ -472,7 +519,7 @@ member leaves group
 member heartbeat is recorded
 current members can be listed
 stale members can be detected
-stale members can be removed internally
+stale members can be removed
 duplicate joins are idempotent
 leaving a missing member is idempotent
 heartbeat for a missing member creates the member
@@ -570,7 +617,7 @@ removed: member-a, member-c
 remaining: member-b
 ```
 
-Stale member removal is currently internal only. It is not exposed through HTTP yet.
+Stale member removal is implemented inside the group registry and exposed through `POST /groups/remove-stale`.
 
 Stale member removal does not persist group state or trigger automatic rebalancing yet.
 
@@ -594,38 +641,38 @@ The project currently has a strong single-node broker and storage foundation.
 
 Completed core areas:
 
-- HTTP broker foundation
-- Topic and partition management
-- Offset-aware append and fetch behavior
-- Segment files
-- Index files with real byte positions
-- Index-backed reads
-- Segment rotation
-- Missing-index rebuild on recovery
-- Consumer offset store
-- Consumer offset commit and lookup endpoints
-- Consumer group assignment engine
-- Consumer group assignment endpoint
-- Consumer group membership registry
-- Consumer group membership endpoints
-- Internal heartbeat tracking foundation
-- Consumer group heartbeat endpoint
-- Internal stale member detection
-- Stale group members endpoint
-- Internal stale member removal
+* HTTP broker foundation
+* Topic and partition management
+* Offset-aware append and fetch behavior
+* Segment files
+* Index files with real byte positions
+* Index-backed reads
+* Segment rotation
+* Missing-index rebuild on recovery
+* Consumer offset store
+* Consumer offset commit and lookup endpoints
+* Consumer group assignment engine
+* Consumer group assignment endpoint
+* Consumer group membership registry
+* Consumer group membership endpoints
+* Internal heartbeat tracking foundation
+* Consumer group heartbeat endpoint
+* Internal stale member detection
+* Stale group members endpoint
+* Internal stale member removal
+* Stale group member removal endpoint
 
 Still planned:
 
-- HTTP stale member removal endpoint
-- Automatic group rebalancing behavior
-- Stronger crash recovery beyond missing-index rebuild
-- Persistent group membership and heartbeat state
-- CLI client
-- Docker Compose demo
-- Metrics and benchmarks
-- Multi-broker replication
-- Leader election / Raft-style coordination
-- Final documentation and demo polish
+* Automatic group rebalancing behavior
+* Stronger crash recovery beyond missing-index rebuild
+* Persistent group membership and heartbeat state
+* CLI client
+* Docker Compose demo
+* Metrics and benchmarks
+* Multi-broker replication
+* Leader election / Raft-style coordination
+* Final documentation and demo polish
 
 ## Project Goal
 
