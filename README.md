@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, and stale member removal.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, and group rebalance calculation.
 
 ## Current Features
 
@@ -15,6 +15,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Consumer offset commit endpoint (`POST /offsets/commit`)
 * Consumer offset lookup endpoint (`GET /offsets`)
 * Consumer group assignment endpoint (`POST /groups/assign`)
+* Consumer group rebalance endpoint (`POST /groups/rebalance`)
 * Consumer group join endpoint (`POST /groups/join`)
 * Consumer group leave endpoint (`POST /groups/leave`)
 * Consumer group heartbeat endpoint (`POST /groups/heartbeat`)
@@ -46,6 +47,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * HTTP stale group member lookup
 * Internal stale group member removal
 * HTTP stale group member removal
+* HTTP group rebalance calculation
 * Topic manager
 * Partition manager
 * Topic partitions wired to partition logs
@@ -67,6 +69,7 @@ server
 → heartbeat tracking
 → stale member detection
 → stale member removal
+→ group rebalance calculation
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -79,7 +82,7 @@ If an index file is missing during partition-log startup, KairoLog can rebuild i
 
 Consumer offsets are stored separately so a consumer group can remember how far it has processed a topic partition.
 
-The group assignment engine distributes topic partitions across consumer group members in a deterministic and balanced way. The HTTP broker exposes this through `POST /groups/assign`.
+The group assignment engine distributes topic partitions across consumer group members in a deterministic and balanced way. The HTTP broker exposes direct assignment through `POST /groups/assign`.
 
 The group membership registry tracks members joining and leaving consumer groups. The HTTP broker exposes this through `POST /groups/join`, `POST /groups/leave`, and `GET /groups/members`.
 
@@ -89,7 +92,7 @@ The group registry can detect stale members by comparing each member’s `LastSe
 
 The group registry can also remove stale members. The HTTP broker exposes stale-member removal through `POST /groups/remove-stale`.
 
-Stale-member removal currently removes members from the in-memory registry only. It does not automatically trigger partition reassignment or rebalance yet.
+The rebalance endpoint calculates topic partition assignments using the currently registered group members. It does not persist assignments yet.
 
 ## Storage Layout
 
@@ -114,7 +117,7 @@ Index files store offset-to-byte-position mappings.
 
 The consumer offset file stores committed offsets for consumer groups.
 
-Current group membership, heartbeat state, stale-member detection, and stale-member removal state are in-memory only and are not persisted yet.
+Current group membership, heartbeat state, stale-member detection, stale-member removal state, and rebalance assignments are in-memory only and are not persisted yet.
 
 ## API
 
@@ -260,7 +263,7 @@ Example response when not found:
 }
 ```
 
-### Assign Topic Partitions to Group Members
+### Assign Topic Partitions to Provided Members
 
 ```http
 POST /groups/assign
@@ -308,6 +311,64 @@ Example response:
   ]
 }
 ```
+
+This endpoint assigns partitions using the member list provided in the request body.
+
+### Rebalance Registered Consumer Group Members
+
+```http
+POST /groups/rebalance
+```
+
+Example request:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders"
+}
+```
+
+Example response:
+
+```json
+{
+  "group": "analytics-workers",
+  "assignments": [
+    {
+      "member_id": "member-a",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [0, 1]
+        }
+      ]
+    },
+    {
+      "member_id": "member-b",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [2, 3]
+        }
+      ]
+    }
+  ]
+}
+```
+
+The rebalance endpoint reads the currently registered members from the group registry, then calculates topic partition assignments for those members.
+
+Current rebalance behavior:
+
+```text
+registered group members
+→ sorted by member ID
+→ topic partition count
+→ deterministic balanced assignment
+```
+
+This endpoint calculates assignments only. It does not persist assignments, commit offsets, remove stale members, or trigger automatic rebalancing yet.
 
 ### Join Consumer Group
 
@@ -500,6 +561,43 @@ member-b → partitions 2, 3
 
 The assignment is deterministic because members are sorted by ID before partitions are assigned.
 
+## Consumer Group Rebalance
+
+The rebalance endpoint calculates topic partition assignments using the current registered members of a group.
+
+Example:
+
+```text
+group: analytics-workers
+topic: orders
+registered members: member-b, member-a
+partitions: 0, 1, 2, 3
+```
+
+The registry returns members sorted by ID:
+
+```text
+member-a
+member-b
+```
+
+Result:
+
+```text
+member-a → partitions 0, 1
+member-b → partitions 2, 3
+```
+
+Current rebalance limits:
+
+```text
+assignments are calculated only
+assignments are not persisted
+stale members are not removed inside rebalance
+offsets are not committed during rebalance
+automatic rebalance is not triggered yet
+```
+
 ## Consumer Group Membership
 
 The group membership registry tracks active members for each group.
@@ -520,6 +618,7 @@ member heartbeat is recorded
 current members can be listed
 stale members can be detected
 stale members can be removed
+registered active members can be rebalanced
 duplicate joins are idempotent
 leaving a missing member is idempotent
 heartbeat for a missing member creates the member
@@ -661,10 +760,12 @@ Completed core areas:
 * Stale group members endpoint
 * Internal stale member removal
 * Stale group member removal endpoint
+* Group rebalance endpoint
 
 Still planned:
 
-* Automatic group rebalancing behavior
+* Rebalance after stale-member cleanup
+* Persistent rebalance assignment state
 * Stronger crash recovery beyond missing-index rebuild
 * Persistent group membership and heartbeat state
 * CLI client
