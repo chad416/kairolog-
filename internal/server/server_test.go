@@ -640,6 +640,353 @@ func TestGroupRebalanceRejectsWrongMethod(t *testing.T) {
 	}
 }
 
+func TestGroupCleanupAndRebalanceRemovesStaleMembersAndRebalancesRemainingMembers(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	createTopic(t, srv.Handler, "orders", 4)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-10*time.Minute))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", time.Now().Add(-time.Second))
+
+	response := cleanupAndRebalanceGroup(t, srv.Handler, "analytics-workers", "orders", 300000)
+	expected := groupCleanupAndRebalanceResponse{
+		Group:          "analytics-workers",
+		Topic:          "orders",
+		TimeoutMS:      300000,
+		RemovedMembers: []groupMemberResponse{{ID: "member-a"}},
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0, 1, 2, 3}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupCleanupAndRebalanceActiveMembersRemainAndReceiveAssignments(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	createTopic(t, srv.Handler, "orders", 4)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-10*time.Minute))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", time.Now().Add(-time.Second))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-c", time.Now().Add(-time.Second))
+
+	response := cleanupAndRebalanceGroup(t, srv.Handler, "analytics-workers", "orders", 300000)
+	expected := groupCleanupAndRebalanceResponse{
+		Group:          "analytics-workers",
+		Topic:          "orders",
+		TimeoutMS:      300000,
+		RemovedMembers: []groupMemberResponse{{ID: "member-a"}},
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0, 1}},
+				},
+			},
+			{
+				MemberID: "member-c",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{2, 3}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupCleanupAndRebalanceRemovedMembersAreReturnedSorted(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+	staleTime := time.Now().Add(-10 * time.Minute)
+
+	createTopic(t, srv.Handler, "orders", 1)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-c", staleTime)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", staleTime)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", staleTime)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-d", time.Now().Add(-time.Second))
+
+	response := cleanupAndRebalanceGroup(t, srv.Handler, "analytics-workers", "orders", 300000)
+	expected := groupCleanupAndRebalanceResponse{
+		Group:     "analytics-workers",
+		Topic:     "orders",
+		TimeoutMS: 300000,
+		RemovedMembers: []groupMemberResponse{
+			{ID: "member-a"},
+			{ID: "member-b"},
+			{ID: "member-c"},
+		},
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-d",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupCleanupAndRebalanceAssignmentsAreDeterministicByMemberID(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	createTopic(t, srv.Handler, "orders", 2)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", time.Now().Add(-time.Second))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-time.Second))
+
+	response := cleanupAndRebalanceGroup(t, srv.Handler, "analytics-workers", "orders", 300000)
+	expected := groupCleanupAndRebalanceResponse{
+		Group:          "analytics-workers",
+		Topic:          "orders",
+		TimeoutMS:      300000,
+		RemovedMembers: []groupMemberResponse{},
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-a",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0}},
+				},
+			},
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{1}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupCleanupAndRebalanceAssignsUnevenPartitionsAfterCleanup(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	createTopic(t, srv.Handler, "orders", 5)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-time.Second))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", time.Now().Add(-time.Second))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-c", time.Now().Add(-10*time.Minute))
+
+	response := cleanupAndRebalanceGroup(t, srv.Handler, "analytics-workers", "orders", 300000)
+	expected := groupCleanupAndRebalanceResponse{
+		Group:          "analytics-workers",
+		Topic:          "orders",
+		TimeoutMS:      300000,
+		RemovedMembers: []groupMemberResponse{{ID: "member-c"}},
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-a",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0, 1, 2}},
+				},
+			},
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{3, 4}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupCleanupAndRebalanceWithNoStaleMembersRebalancesAllActiveMembers(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	createTopic(t, srv.Handler, "orders", 4)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-time.Second))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", time.Now().Add(-time.Second))
+
+	response := cleanupAndRebalanceGroup(t, srv.Handler, "analytics-workers", "orders", 300000)
+	expected := groupCleanupAndRebalanceResponse{
+		Group:          "analytics-workers",
+		Topic:          "orders",
+		TimeoutMS:      300000,
+		RemovedMembers: []groupMemberResponse{},
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-a",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0, 1}},
+				},
+			},
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{2, 3}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupCleanupAndRebalanceRejectsUnknownTopic(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-time.Second))
+
+	recorder := performRequest(srv.Handler, http.MethodPost, "/groups/cleanup-and-rebalance", groupCleanupAndRebalanceRequest{
+		Group:     "analytics-workers",
+		Topic:     "missing",
+		TimeoutMS: 300000,
+	})
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected status %d, got %d", http.StatusNotFound, recorder.Code)
+	}
+}
+
+func TestGroupCleanupAndRebalanceRejectsGroupWithNoMembers(t *testing.T) {
+	srv := newTestServer(t)
+
+	createTopic(t, srv.Handler, "orders", 2)
+
+	recorder := performRequest(srv.Handler, http.MethodPost, "/groups/cleanup-and-rebalance", groupCleanupAndRebalanceRequest{
+		Group:     "analytics-workers",
+		Topic:     "orders",
+		TimeoutMS: 300000,
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
+func TestGroupCleanupAndRebalanceRejectsWhenAllMembersAreStaleAndRemoved(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+	staleTime := time.Now().Add(-10 * time.Minute)
+
+	createTopic(t, srv.Handler, "orders", 2)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", staleTime)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", staleTime)
+
+	recorder := performRequest(srv.Handler, http.MethodPost, "/groups/cleanup-and-rebalance", groupCleanupAndRebalanceRequest{
+		Group:     "analytics-workers",
+		Topic:     "orders",
+		TimeoutMS: 300000,
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
+func TestGroupCleanupAndRebalanceRejectsInvalidBody(t *testing.T) {
+	srv := newTestServer(t)
+
+	tests := []struct {
+		name string
+		body interface{}
+	}{
+		{
+			name: "missing group",
+			body: map[string]interface{}{
+				"topic":      "orders",
+				"timeout_ms": 300000,
+			},
+		},
+		{
+			name: "empty group",
+			body: groupCleanupAndRebalanceRequest{
+				Group:     "",
+				Topic:     "orders",
+				TimeoutMS: 300000,
+			},
+		},
+		{
+			name: "missing topic",
+			body: map[string]interface{}{
+				"group":      "analytics-workers",
+				"timeout_ms": 300000,
+			},
+		},
+		{
+			name: "empty topic",
+			body: groupCleanupAndRebalanceRequest{
+				Group:     "analytics-workers",
+				Topic:     "",
+				TimeoutMS: 300000,
+			},
+		},
+		{
+			name: "missing timeout",
+			body: map[string]interface{}{
+				"group": "analytics-workers",
+				"topic": "orders",
+			},
+		},
+		{
+			name: "zero timeout",
+			body: groupCleanupAndRebalanceRequest{
+				Group:     "analytics-workers",
+				Topic:     "orders",
+				TimeoutMS: 0,
+			},
+		},
+		{
+			name: "negative timeout",
+			body: groupCleanupAndRebalanceRequest{
+				Group:     "analytics-workers",
+				Topic:     "orders",
+				TimeoutMS: -1,
+			},
+		},
+		{
+			name: "invalid timeout",
+			body: map[string]interface{}{
+				"group":      "analytics-workers",
+				"topic":      "orders",
+				"timeout_ms": "invalid",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := performRequest(srv.Handler, http.MethodPost, "/groups/cleanup-and-rebalance", tt.body)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestGroupCleanupAndRebalanceRejectsInvalidJSON(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRawRequest(srv.Handler, http.MethodPost, "/groups/cleanup-and-rebalance", "{")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+	}
+}
+
+func TestGroupCleanupAndRebalanceRejectsWrongMethod(t *testing.T) {
+	srv := newTestServer(t)
+
+	recorder := performRequest(srv.Handler, http.MethodGet, "/groups/cleanup-and-rebalance", nil)
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected status %d, got %d", http.StatusMethodNotAllowed, recorder.Code)
+	}
+}
+
 func TestGroupJoin(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -1355,6 +1702,7 @@ func TestGroupMembershipRejectsWrongMethods(t *testing.T) {
 		{name: "stale", method: http.MethodPost, path: "/groups/stale?group=analytics-workers&timeout_ms=300000"},
 		{name: "remove stale", method: http.MethodGet, path: "/groups/remove-stale"},
 		{name: "rebalance", method: http.MethodGet, path: "/groups/rebalance"},
+		{name: "cleanup and rebalance", method: http.MethodGet, path: "/groups/cleanup-and-rebalance"},
 	}
 
 	for _, tt := range tests {
@@ -1481,6 +1829,24 @@ func rebalanceGroup(t *testing.T, handler http.Handler, groupName string, topicN
 		Group: groupName,
 		Topic: topicName,
 	})
+}
+
+func cleanupAndRebalanceGroup(t *testing.T, handler http.Handler, groupName string, topicName string, timeoutMS int64) groupCleanupAndRebalanceResponse {
+	t.Helper()
+
+	recorder := performRequest(handler, http.MethodPost, "/groups/cleanup-and-rebalance", groupCleanupAndRebalanceRequest{
+		Group:     groupName,
+		Topic:     topicName,
+		TimeoutMS: timeoutMS,
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupCleanupAndRebalanceResponse
+	decodeJSON(t, recorder, &response)
+
+	return response
 }
 
 func joinGroup(t *testing.T, handler http.Handler, groupName string, memberID string) *httptest.ResponseRecorder {

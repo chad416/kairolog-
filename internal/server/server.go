@@ -99,6 +99,20 @@ type groupRebalanceResponse struct {
 	Assignments []groupAssignmentResponse `json:"assignments"`
 }
 
+type groupCleanupAndRebalanceRequest struct {
+	Group     string `json:"group"`
+	Topic     string `json:"topic"`
+	TimeoutMS int64  `json:"timeout_ms"`
+}
+
+type groupCleanupAndRebalanceResponse struct {
+	Group          string                    `json:"group"`
+	Topic          string                    `json:"topic"`
+	TimeoutMS      int64                     `json:"timeout_ms"`
+	RemovedMembers []groupMemberResponse     `json:"removed_members"`
+	Assignments    []groupAssignmentResponse `json:"assignments"`
+}
+
 type groupAssignmentResponse struct {
 	MemberID string                         `json:"member_id"`
 	Topics   []groupTopicAssignmentResponse `json:"topics"`
@@ -190,6 +204,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/groups/stale", s.groupStaleHandler)
 	mux.HandleFunc("/groups/remove-stale", s.groupRemoveStaleHandler)
 	mux.HandleFunc("/groups/rebalance", s.groupRebalanceHandler)
+	mux.HandleFunc("/groups/cleanup-and-rebalance", s.groupCleanupAndRebalanceHandler)
 
 	return mux
 }
@@ -553,6 +568,88 @@ func (s *Server) groupRebalanceHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, groupRebalanceResponse{
 		Group:       groupName,
 		Assignments: convertGroupAssignments(assignments),
+	})
+}
+
+func (s *Server) groupCleanupAndRebalanceHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req groupCleanupAndRebalanceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	groupName := strings.TrimSpace(req.Group)
+	if groupName == "" {
+		http.Error(w, "missing group", http.StatusBadRequest)
+		return
+	}
+
+	topicName := strings.TrimSpace(req.Topic)
+	if topicName == "" {
+		http.Error(w, "missing topic", http.StatusBadRequest)
+		return
+	}
+
+	if req.TimeoutMS <= 0 {
+		http.Error(w, "invalid timeout", http.StatusBadRequest)
+		return
+	}
+
+	topicInfo, exists := s.topicManager.GetTopic(topicName)
+	if !exists {
+		http.Error(w, "topic not found", http.StatusNotFound)
+		return
+	}
+
+	if s.registry == nil {
+		http.Error(w, "group registry is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	timeout := time.Duration(req.TimeoutMS) * time.Millisecond
+	removedMembers, err := s.registry.RemoveStaleMembers(groupName, time.Now(), timeout)
+	if err != nil {
+		http.Error(w, "failed to remove stale group members", http.StatusBadRequest)
+		return
+	}
+
+	remainingMembers, err := s.registry.Members(groupName)
+	if err != nil {
+		http.Error(w, "failed to get group members", http.StatusBadRequest)
+		return
+	}
+	if len(remainingMembers) == 0 {
+		http.Error(w, "group has no members", http.StatusBadRequest)
+		return
+	}
+
+	if s.assigner == nil {
+		http.Error(w, "assigner is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	members := make([]group.Member, 0, len(remainingMembers))
+	for _, member := range remainingMembers {
+		members = append(members, group.Member{ID: member.ID})
+	}
+
+	assignments, err := s.assigner.Assign(topicName, len(topicInfo.Partitions), members)
+	if err != nil {
+		http.Error(w, "failed to assign partitions", http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupCleanupAndRebalanceResponse{
+		Group:          groupName,
+		Topic:          topicName,
+		TimeoutMS:      req.TimeoutMS,
+		RemovedMembers: convertGroupMembers(removedMembers),
+		Assignments:    convertGroupAssignments(assignments),
 	})
 }
 
