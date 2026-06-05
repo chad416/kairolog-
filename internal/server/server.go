@@ -18,10 +18,11 @@ const defaultAddr = ":8080"
 const defaultOffsetStorePath = "data/consumer_offsets.log"
 
 type Server struct {
-	topicManager *topic.Manager
-	offsetStore  *consumer.OffsetStore
-	assigner     *group.Assigner
-	registry     *group.Registry
+	topicManager    *topic.Manager
+	offsetStore     *consumer.OffsetStore
+	assigner        *group.Assigner
+	registry        *group.Registry
+	assignmentStore *group.AssignmentStore
 }
 
 type healthResponse struct {
@@ -176,10 +177,11 @@ func newServer(topicManager *topic.Manager, offsetStores ...*consumer.OffsetStor
 	}
 
 	server := &Server{
-		topicManager: topicManager,
-		offsetStore:  offsetStore,
-		assigner:     group.NewAssigner(),
-		registry:     group.NewRegistry(),
+		topicManager:    topicManager,
+		offsetStore:     offsetStore,
+		assigner:        group.NewAssigner(),
+		registry:        group.NewRegistry(),
+		assignmentStore: group.NewAssignmentStore(),
 	}
 
 	return &http.Server{
@@ -565,6 +567,15 @@ func (s *Server) groupRebalanceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.assignmentStore == nil {
+		http.Error(w, "assignment store is not initialized", http.StatusInternalServerError)
+		return
+	}
+	if err := s.assignmentStore.Save(groupName, topicName, assignments); err != nil {
+		http.Error(w, "failed to save assignments", http.StatusInternalServerError)
+		return
+	}
+
 	writeJSON(w, http.StatusOK, groupRebalanceResponse{
 		Group:       groupName,
 		Assignments: convertGroupAssignments(assignments),
@@ -641,6 +652,15 @@ func (s *Server) groupCleanupAndRebalanceHandler(w http.ResponseWriter, r *http.
 	assignments, err := s.assigner.Assign(topicName, len(topicInfo.Partitions), members)
 	if err != nil {
 		http.Error(w, "failed to assign partitions", http.StatusBadRequest)
+		return
+	}
+
+	if s.assignmentStore == nil {
+		http.Error(w, "assignment store is not initialized", http.StatusInternalServerError)
+		return
+	}
+	if err := s.assignmentStore.Save(groupName, topicName, assignments); err != nil {
+		http.Error(w, "failed to save assignments", http.StatusInternalServerError)
 		return
 	}
 

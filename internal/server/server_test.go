@@ -640,6 +640,58 @@ func TestGroupRebalanceRejectsWrongMethod(t *testing.T) {
 	}
 }
 
+func TestGroupRebalanceSavesAssignments(t *testing.T) {
+	srv, _, assignmentStore := newTestServerWithRegistryAndAssignmentStore(t)
+
+	createTopic(t, srv.Handler, "orders", 4)
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	joinGroup(t, srv.Handler, "analytics-workers", "member-b")
+
+	recorder := rebalanceGroup(t, srv.Handler, "analytics-workers", "orders")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	assignments, found, err := assignmentStore.Get("analytics-workers", "orders")
+	if err != nil {
+		t.Fatalf("failed to get saved assignments: %v", err)
+	}
+	if !found {
+		t.Fatal("expected saved assignments to be found")
+	}
+
+	expected := []group.Assignment{
+		{
+			MemberID: "member-a",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{0, 1}},
+			},
+		},
+		{
+			MemberID: "member-b",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{2, 3}},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(assignments, expected) {
+		t.Fatalf("expected %v, got %v", expected, assignments)
+	}
+}
+
+func TestGroupRebalanceWithNilAssignmentStoreReturnsInternalServerError(t *testing.T) {
+	srv := newTestServerWithNilAssignmentStore(t)
+
+	createTopic(t, srv.Handler, "orders", 2)
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+
+	recorder := rebalanceGroup(t, srv.Handler, "analytics-workers", "orders")
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status %d, got %d", http.StatusInternalServerError, recorder.Code)
+	}
+}
+
 func TestGroupCleanupAndRebalanceRemovesStaleMembersAndRebalancesRemainingMembers(t *testing.T) {
 	srv, registry := newTestServerWithRegistry(t)
 
@@ -984,6 +1036,84 @@ func TestGroupCleanupAndRebalanceRejectsWrongMethod(t *testing.T) {
 	recorder := performRequest(srv.Handler, http.MethodGet, "/groups/cleanup-and-rebalance", nil)
 	if recorder.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected status %d, got %d", http.StatusMethodNotAllowed, recorder.Code)
+	}
+}
+
+func TestGroupCleanupAndRebalanceSavesAssignments(t *testing.T) {
+	srv, registry, assignmentStore := newTestServerWithRegistryAndAssignmentStore(t)
+
+	createTopic(t, srv.Handler, "orders", 4)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-10*time.Minute))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", time.Now().Add(-time.Second))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-c", time.Now().Add(-time.Second))
+
+	response := cleanupAndRebalanceGroup(t, srv.Handler, "analytics-workers", "orders", 300000)
+	expectedResponse := groupCleanupAndRebalanceResponse{
+		Group:          "analytics-workers",
+		Topic:          "orders",
+		TimeoutMS:      300000,
+		RemovedMembers: []groupMemberResponse{{ID: "member-a"}},
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0, 1}},
+				},
+			},
+			{
+				MemberID: "member-c",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{2, 3}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expectedResponse) {
+		t.Fatalf("expected %v, got %v", expectedResponse, response)
+	}
+
+	assignments, found, err := assignmentStore.Get("analytics-workers", "orders")
+	if err != nil {
+		t.Fatalf("failed to get saved assignments: %v", err)
+	}
+	if !found {
+		t.Fatal("expected saved assignments to be found")
+	}
+
+	expectedAssignments := []group.Assignment{
+		{
+			MemberID: "member-b",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{0, 1}},
+			},
+		},
+		{
+			MemberID: "member-c",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{2, 3}},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(assignments, expectedAssignments) {
+		t.Fatalf("expected %v, got %v", expectedAssignments, assignments)
+	}
+}
+
+func TestGroupCleanupAndRebalanceWithNilAssignmentStoreReturnsInternalServerError(t *testing.T) {
+	srv, registry := newTestServerWithNilAssignmentStoreAndRegistry(t)
+
+	createTopic(t, srv.Handler, "orders", 2)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-time.Second))
+
+	recorder := performRequest(srv.Handler, http.MethodPost, "/groups/cleanup-and-rebalance", groupCleanupAndRebalanceRequest{
+		Group:     "analytics-workers",
+		Topic:     "orders",
+		TimeoutMS: 300000,
+	})
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status %d, got %d", http.StatusInternalServerError, recorder.Code)
 	}
 }
 
@@ -1728,6 +1858,45 @@ func newTestServer(t *testing.T) *http.Server {
 }
 
 func newTestServerWithRegistry(t *testing.T) (*http.Server, *group.Registry) {
+	t.Helper()
+
+	srv, registry, _ := newTestServerWithRegistryAndAssignmentStore(t)
+	return srv, registry
+}
+
+func newTestServerWithRegistryAndAssignmentStore(t *testing.T) (*http.Server, *group.Registry, *group.AssignmentStore) {
+	t.Helper()
+	chdirTemp(t)
+
+	offsetStore, err := consumer.NewOffsetStore(defaultOffsetStorePath)
+	if err != nil {
+		t.Fatalf("failed to create offset store: %v", err)
+	}
+
+	registry := group.NewRegistry()
+	assignmentStore := group.NewAssignmentStore()
+	server := &Server{
+		topicManager:    topic.NewManager(),
+		offsetStore:     offsetStore,
+		assigner:        group.NewAssigner(),
+		registry:        registry,
+		assignmentStore: assignmentStore,
+	}
+
+	return &http.Server{
+		Addr:    defaultAddr,
+		Handler: server.routes(),
+	}, registry, assignmentStore
+}
+
+func newTestServerWithNilAssignmentStore(t *testing.T) *http.Server {
+	t.Helper()
+
+	srv, _ := newTestServerWithNilAssignmentStoreAndRegistry(t)
+	return srv
+}
+
+func newTestServerWithNilAssignmentStoreAndRegistry(t *testing.T) (*http.Server, *group.Registry) {
 	t.Helper()
 	chdirTemp(t)
 
