@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, and group rebalance calculation.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, and cleanup-and-rebalance flow.
 
 ## Current Features
 
@@ -16,6 +16,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Consumer offset lookup endpoint (`GET /offsets`)
 * Consumer group assignment endpoint (`POST /groups/assign`)
 * Consumer group rebalance endpoint (`POST /groups/rebalance`)
+* Consumer group cleanup-and-rebalance endpoint (`POST /groups/cleanup-and-rebalance`)
 * Consumer group join endpoint (`POST /groups/join`)
 * Consumer group leave endpoint (`POST /groups/leave`)
 * Consumer group heartbeat endpoint (`POST /groups/heartbeat`)
@@ -48,6 +49,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Internal stale group member removal
 * HTTP stale group member removal
 * HTTP group rebalance calculation
+* HTTP cleanup-and-rebalance flow
 * Topic manager
 * Partition manager
 * Topic partitions wired to partition logs
@@ -70,6 +72,7 @@ server
 → stale member detection
 → stale member removal
 → group rebalance calculation
+→ cleanup-and-rebalance flow
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -90,9 +93,11 @@ The group registry tracks `LastSeen` timestamps for members. A member receives a
 
 The group registry can detect stale members by comparing each member’s `LastSeen` timestamp against a timeout window. The HTTP broker exposes detection through `GET /groups/stale`.
 
-The group registry can also remove stale members. The HTTP broker exposes stale-member removal through `POST /groups/remove-stale`.
+The group registry can remove stale members. The HTTP broker exposes stale-member removal through `POST /groups/remove-stale`.
 
 The rebalance endpoint calculates topic partition assignments using the currently registered group members. It does not persist assignments yet.
+
+The cleanup-and-rebalance endpoint removes stale members first, then calculates fresh assignments for the remaining active members.
 
 ## Storage Layout
 
@@ -117,7 +122,7 @@ Index files store offset-to-byte-position mappings.
 
 The consumer offset file stores committed offsets for consumer groups.
 
-Current group membership, heartbeat state, stale-member detection, stale-member removal state, and rebalance assignments are in-memory only and are not persisted yet.
+Current group membership, heartbeat state, stale-member detection, stale-member removal state, rebalance assignments, and cleanup-and-rebalance assignments are in-memory only and are not persisted yet.
 
 ## API
 
@@ -368,7 +373,67 @@ registered group members
 → deterministic balanced assignment
 ```
 
-This endpoint calculates assignments only. It does not persist assignments, commit offsets, remove stale members, or trigger automatic rebalancing yet.
+This endpoint calculates assignments only. It does not persist assignments, commit offsets, remove stale members, or trigger background rebalancing.
+
+### Cleanup and Rebalance Consumer Group
+
+```http
+POST /groups/cleanup-and-rebalance
+```
+
+Example request:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders",
+  "timeout_ms": 300000
+}
+```
+
+Example response:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders",
+  "timeout_ms": 300000,
+  "removed_members": [
+    {
+      "id": "member-a"
+    }
+  ],
+  "assignments": [
+    {
+      "member_id": "member-b",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [0, 1, 2, 3]
+        }
+      ]
+    }
+  ]
+}
+```
+
+The cleanup-and-rebalance endpoint performs two operations in one request:
+
+```text
+remove stale members
+→ get remaining active members
+→ calculate fresh topic partition assignments
+```
+
+A member is removed when:
+
+```text
+now - LastSeen > timeout
+```
+
+If all members are stale and removed, the endpoint returns `400 Bad Request` because there are no remaining active members to receive assignments.
+
+This endpoint does not persist assignments, commit offsets, expose `LastSeen`, or run as a background cleanup process.
 
 ### Join Consumer Group
 
@@ -538,7 +603,7 @@ The endpoint currently returns removed member IDs only. `LastSeen` is still trac
 
 If the group does not exist, the endpoint returns an empty `removed_members` array.
 
-This endpoint removes stale members from the in-memory group registry. It does not trigger automatic partition reassignment or rebalancing yet.
+This endpoint removes stale members from the in-memory group registry. It does not trigger automatic partition reassignment or rebalancing.
 
 ## Consumer Group Assignment
 
@@ -593,9 +658,52 @@ Current rebalance limits:
 ```text
 assignments are calculated only
 assignments are not persisted
-stale members are not removed inside rebalance
+stale members are not removed inside /groups/rebalance
 offsets are not committed during rebalance
-automatic rebalance is not triggered yet
+background rebalance is not triggered
+```
+
+## Cleanup and Rebalance Flow
+
+The cleanup-and-rebalance endpoint combines stale-member removal with fresh partition assignment.
+
+Example before cleanup:
+
+```text
+group: analytics-workers
+topic: orders
+timeout: 5 minutes
+
+member-a LastSeen: 11:54 → stale
+member-b LastSeen: 11:59 → active
+member-c LastSeen: 11:59 → active
+```
+
+Request at 12:00:
+
+```http
+POST /groups/cleanup-and-rebalance
+```
+
+Result:
+
+```text
+removed: member-a
+remaining active members: member-b, member-c
+new assignment:
+member-b → partitions 0, 1
+member-c → partitions 2, 3
+```
+
+Current cleanup-and-rebalance limits:
+
+```text
+assignments are calculated only
+assignments are not persisted
+offsets are not committed
+LastSeen is not exposed in HTTP responses
+cleanup runs only when the endpoint is called
+there is no background cleanup loop yet
 ```
 
 ## Consumer Group Membership
@@ -619,6 +727,7 @@ current members can be listed
 stale members can be detected
 stale members can be removed
 registered active members can be rebalanced
+stale members can be removed and remaining members rebalanced in one request
 duplicate joins are idempotent
 leaving a missing member is idempotent
 heartbeat for a missing member creates the member
@@ -648,7 +757,7 @@ Leave(group, memberID)
 
 Heartbeat tracking is implemented inside the group registry and exposed through `POST /groups/heartbeat`.
 
-Heartbeat tracking does not yet automatically trigger rebalancing.
+Heartbeat tracking does not run automatic background cleanup yet.
 
 ## Stale Member Detection
 
@@ -718,7 +827,7 @@ remaining: member-b
 
 Stale member removal is implemented inside the group registry and exposed through `POST /groups/remove-stale`.
 
-Stale member removal does not persist group state or trigger automatic rebalancing yet.
+Stale member removal does not persist group state or trigger background rebalancing.
 
 ## Running Tests
 
@@ -761,13 +870,14 @@ Completed core areas:
 * Internal stale member removal
 * Stale group member removal endpoint
 * Group rebalance endpoint
+* Cleanup-and-rebalance endpoint
 
 Still planned:
 
-* Rebalance after stale-member cleanup
 * Persistent rebalance assignment state
-* Stronger crash recovery beyond missing-index rebuild
 * Persistent group membership and heartbeat state
+* Background stale-member cleanup loop
+* Stronger crash recovery beyond missing-index rebuild
 * CLI client
 * Docker Compose demo
 * Metrics and benchmarks
