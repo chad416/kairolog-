@@ -54,6 +54,8 @@ The current focus is the single-node broker and storage foundation: topics, part
 * In-memory assignment storage by group/topic
 * Assignment save, lookup, delete, and delete-group operations
 * Deep-copy protection for stored assignments
+* Server-wired assignment storage after rebalance
+* Server-wired assignment storage after cleanup-and-rebalance
 * Topic manager
 * Partition manager
 * Topic partitions wired to partition logs
@@ -100,11 +102,11 @@ The group registry can detect stale members by comparing each member’s `LastSe
 
 The group registry can remove stale members. The HTTP broker exposes stale-member removal through `POST /groups/remove-stale`.
 
-The rebalance endpoint calculates topic partition assignments using the currently registered group members. It does not persist assignments through the server yet.
+The rebalance endpoint calculates topic partition assignments using the currently registered group members, then saves the latest assignment state into the internal assignment store.
 
-The cleanup-and-rebalance endpoint removes stale members first, then calculates fresh assignments for the remaining active members. It also does not persist assignments through the server yet.
+The cleanup-and-rebalance endpoint removes stale members first, calculates fresh assignments for the remaining active members, then saves the latest assignment state into the internal assignment store.
 
-The internal assignment store can save the latest calculated assignments for a group/topic pair. It is currently implemented inside the `internal/group` package and is not wired into the HTTP server yet.
+The internal assignment store keeps the latest calculated assignments for each group/topic pair. It is currently in-memory only and is not exposed through a lookup HTTP endpoint yet.
 
 ## Storage Layout
 
@@ -324,7 +326,7 @@ Example response:
 }
 ```
 
-This endpoint assigns partitions using the member list provided in the request body.
+This endpoint assigns partitions using the member list provided in the request body. It does not save assignments into the internal assignment store.
 
 ### Rebalance Registered Consumer Group Members
 
@@ -369,7 +371,7 @@ Example response:
 }
 ```
 
-The rebalance endpoint reads the currently registered members from the group registry, then calculates topic partition assignments for those members.
+The rebalance endpoint reads the currently registered members from the group registry, calculates topic partition assignments for those members, and saves the latest assignment result into the internal assignment store.
 
 Current rebalance behavior:
 
@@ -378,9 +380,10 @@ registered group members
 → sorted by member ID
 → topic partition count
 → deterministic balanced assignment
+→ save latest assignment state by group/topic
 ```
 
-This endpoint calculates assignments only. It does not persist assignments, commit offsets, remove stale members, or trigger background rebalancing yet.
+This endpoint does not commit offsets, remove stale members, persist assignments to disk, or trigger background rebalancing.
 
 ### Cleanup and Rebalance Consumer Group
 
@@ -424,12 +427,13 @@ Example response:
 }
 ```
 
-The cleanup-and-rebalance endpoint performs two operations in one request:
+The cleanup-and-rebalance endpoint performs three operations in one request:
 
 ```text
 remove stale members
 → get remaining active members
 → calculate fresh topic partition assignments
+→ save latest assignment state by group/topic
 ```
 
 A member is removed when:
@@ -440,7 +444,7 @@ now - LastSeen > timeout
 
 If all members are stale and removed, the endpoint returns `400 Bad Request` because there are no remaining active members to receive assignments.
 
-This endpoint does not persist assignments, commit offsets, expose `LastSeen`, or run as a background cleanup process.
+This endpoint does not persist assignments to disk, commit offsets, expose `LastSeen`, or run as a background cleanup process.
 
 ### Join Consumer Group
 
@@ -635,7 +639,7 @@ The assignment is deterministic because members are sorted by ID before partitio
 
 ## Consumer Group Rebalance
 
-The rebalance endpoint calculates topic partition assignments using the current registered members of a group.
+The rebalance endpoint calculates topic partition assignments using the current registered members of a group and saves the result into the assignment store.
 
 Example:
 
@@ -660,11 +664,19 @@ member-a → partitions 0, 1
 member-b → partitions 2, 3
 ```
 
+Saved internally as:
+
+```text
+analytics-workers/orders
+→ latest assignment result
+```
+
 Current rebalance limits:
 
 ```text
-assignments are calculated only
-assignments are not persisted through the server yet
+assignments are stored in memory only
+assignments are not persisted to disk
+saved assignments are not exposed through HTTP yet
 stale members are not removed inside /groups/rebalance
 offsets are not committed during rebalance
 background rebalance is not triggered
@@ -672,7 +684,7 @@ background rebalance is not triggered
 
 ## Cleanup and Rebalance Flow
 
-The cleanup-and-rebalance endpoint combines stale-member removal with fresh partition assignment.
+The cleanup-and-rebalance endpoint combines stale-member removal with fresh partition assignment and saves the result into the assignment store.
 
 Example before cleanup:
 
@@ -702,11 +714,19 @@ member-b → partitions 0, 1
 member-c → partitions 2, 3
 ```
 
+Saved internally as:
+
+```text
+analytics-workers/orders
+→ latest assignment result after cleanup
+```
+
 Current cleanup-and-rebalance limits:
 
 ```text
-assignments are calculated only
-assignments are not persisted through the server yet
+assignments are stored in memory only
+assignments are not persisted to disk
+saved assignments are not exposed through HTTP yet
 offsets are not committed
 LastSeen is not exposed in HTTP responses
 cleanup runs only when the endpoint is called
@@ -763,7 +783,7 @@ Current assignment store limits:
 ```text
 in-memory only
 not persisted to disk
-not wired into HTTP server yet
+not exposed through HTTP lookup yet
 does not commit offsets
 does not trigger rebalance by itself
 ```
@@ -935,11 +955,13 @@ Completed core areas:
 * Group rebalance endpoint
 * Cleanup-and-rebalance endpoint
 * Internal assignment store
+* Server-wired assignment store saving after rebalance
+* Server-wired assignment store saving after cleanup-and-rebalance
 
 Still planned:
 
-* Wire assignment store into the HTTP server
-* Persist rebalance assignment state through server operations
+* Expose saved assignments through HTTP
+* Persist assignment state to disk
 * Persistent group membership and heartbeat state
 * Background stale-member cleanup loop
 * Stronger crash recovery beyond missing-index rebuild
