@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, and cleanup-and-rebalance flow.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, and internal assignment state storage.
 
 ## Current Features
 
@@ -50,6 +50,10 @@ The current focus is the single-node broker and storage foundation: topics, part
 * HTTP stale group member removal
 * HTTP group rebalance calculation
 * HTTP cleanup-and-rebalance flow
+* Internal group assignment store
+* In-memory assignment storage by group/topic
+* Assignment save, lookup, delete, and delete-group operations
+* Deep-copy protection for stored assignments
 * Topic manager
 * Partition manager
 * Topic partitions wired to partition logs
@@ -73,6 +77,7 @@ server
 → stale member removal
 → group rebalance calculation
 → cleanup-and-rebalance flow
+→ assignment store
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -95,9 +100,11 @@ The group registry can detect stale members by comparing each member’s `LastSe
 
 The group registry can remove stale members. The HTTP broker exposes stale-member removal through `POST /groups/remove-stale`.
 
-The rebalance endpoint calculates topic partition assignments using the currently registered group members. It does not persist assignments yet.
+The rebalance endpoint calculates topic partition assignments using the currently registered group members. It does not persist assignments through the server yet.
 
-The cleanup-and-rebalance endpoint removes stale members first, then calculates fresh assignments for the remaining active members.
+The cleanup-and-rebalance endpoint removes stale members first, then calculates fresh assignments for the remaining active members. It also does not persist assignments through the server yet.
+
+The internal assignment store can save the latest calculated assignments for a group/topic pair. It is currently implemented inside the `internal/group` package and is not wired into the HTTP server yet.
 
 ## Storage Layout
 
@@ -122,7 +129,7 @@ Index files store offset-to-byte-position mappings.
 
 The consumer offset file stores committed offsets for consumer groups.
 
-Current group membership, heartbeat state, stale-member detection, stale-member removal state, rebalance assignments, and cleanup-and-rebalance assignments are in-memory only and are not persisted yet.
+Current group membership, heartbeat state, stale-member detection, stale-member removal state, rebalance assignments, cleanup-and-rebalance assignments, and assignment store state are in-memory only and are not persisted to disk yet.
 
 ## API
 
@@ -373,7 +380,7 @@ registered group members
 → deterministic balanced assignment
 ```
 
-This endpoint calculates assignments only. It does not persist assignments, commit offsets, remove stale members, or trigger background rebalancing.
+This endpoint calculates assignments only. It does not persist assignments, commit offsets, remove stale members, or trigger background rebalancing yet.
 
 ### Cleanup and Rebalance Consumer Group
 
@@ -657,7 +664,7 @@ Current rebalance limits:
 
 ```text
 assignments are calculated only
-assignments are not persisted
+assignments are not persisted through the server yet
 stale members are not removed inside /groups/rebalance
 offsets are not committed during rebalance
 background rebalance is not triggered
@@ -699,11 +706,66 @@ Current cleanup-and-rebalance limits:
 
 ```text
 assignments are calculated only
-assignments are not persisted
+assignments are not persisted through the server yet
 offsets are not committed
 LastSeen is not exposed in HTTP responses
 cleanup runs only when the endpoint is called
 there is no background cleanup loop yet
+```
+
+## Assignment Store
+
+The assignment store keeps the latest assignment result for a group/topic pair.
+
+Internal API:
+
+```text
+NewAssignmentStore()
+Save(group, topic, assignments)
+Get(group, topic)
+Delete(group, topic)
+DeleteGroup(group)
+```
+
+Assignment store behavior:
+
+```text
+Save → stores/replaces latest assignments for group/topic
+Get → returns assignments and found=true when present
+Get → returns found=false when missing
+Delete → removes one group/topic assignment
+DeleteGroup → removes all assignments for a group
+```
+
+The assignment store is concurrency-safe and uses an internal `sync.RWMutex`.
+
+Assignments are deep-copied when saved and deep-copied again when fetched. This prevents outside mutation from corrupting store state.
+
+Example:
+
+```text
+group: analytics-workers
+topic: orders
+
+member-a → partitions 0, 1
+member-b → partitions 2, 3
+```
+
+Stored as:
+
+```text
+analytics-workers/orders
+→ latest assignment result
+```
+
+Current assignment store limits:
+
+```text
+in-memory only
+not persisted to disk
+not wired into HTTP server yet
+does not commit offsets
+does not trigger rebalance by itself
 ```
 
 ## Consumer Group Membership
@@ -728,6 +790,7 @@ stale members can be detected
 stale members can be removed
 registered active members can be rebalanced
 stale members can be removed and remaining members rebalanced in one request
+latest assignments can be stored internally by group/topic
 duplicate joins are idempotent
 leaving a missing member is idempotent
 heartbeat for a missing member creates the member
@@ -871,10 +934,12 @@ Completed core areas:
 * Stale group member removal endpoint
 * Group rebalance endpoint
 * Cleanup-and-rebalance endpoint
+* Internal assignment store
 
 Still planned:
 
-* Persistent rebalance assignment state
+* Wire assignment store into the HTTP server
+* Persist rebalance assignment state through server operations
 * Persistent group membership and heartbeat state
 * Background stale-member cleanup loop
 * Stronger crash recovery beyond missing-index rebuild
