@@ -1368,6 +1368,19 @@ func TestNewWiresFileBackedAssignmentStore(t *testing.T) {
 	}
 }
 
+func TestNewWiresFileBackedGroupRegistry(t *testing.T) {
+	chdirTemp(t)
+
+	srv := newTestServerInCurrentDir(t)
+	if srv == nil {
+		t.Fatal("expected server")
+	}
+
+	if _, err := os.Stat(defaultRegistryStorePath); err != nil {
+		t.Fatalf("expected registry store file to exist: %v", err)
+	}
+}
+
 func TestGroupAssignmentsSavedThroughRebalanceSurviveServerRestart(t *testing.T) {
 	chdirTemp(t)
 
@@ -1467,6 +1480,187 @@ func TestGroupAssignmentsDeletePersistsDeletionToDisk(t *testing.T) {
 		Topic:       "orders",
 		Found:       false,
 		Assignments: []groupAssignmentResponse{},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupJoinSurvivesServerRestart(t *testing.T) {
+	chdirTemp(t)
+
+	srv := newTestServerInCurrentDir(t)
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+
+	restarted := newTestServerInCurrentDir(t)
+	members := getGroupMembers(t, restarted.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{{ID: "member-a"}},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupHeartbeatSurvivesServerRestart(t *testing.T) {
+	chdirTemp(t)
+
+	srv := newTestServerInCurrentDir(t)
+	heartbeatGroup(t, srv.Handler, "analytics-workers", "member-a")
+
+	restarted := newTestServerInCurrentDir(t)
+	members := getGroupMembers(t, restarted.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{{ID: "member-a"}},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+
+	registryStore := loadDefaultRegistryFileStore(t)
+	storedMembers, err := registryStore.Members("analytics-workers")
+	if err != nil {
+		t.Fatalf("failed to get stored members: %v", err)
+	}
+	if len(storedMembers) != 1 {
+		t.Fatalf("expected 1 stored member, got %d", len(storedMembers))
+	}
+	if storedMembers[0].LastSeen.IsZero() {
+		t.Fatal("expected persisted LastSeen to be set")
+	}
+}
+
+func TestGroupLeavePersistsDeletionToDisk(t *testing.T) {
+	chdirTemp(t)
+
+	srv := newTestServerInCurrentDir(t)
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	leaveGroup(t, srv.Handler, "analytics-workers", "member-a")
+
+	restarted := newTestServerInCurrentDir(t)
+	members := getGroupMembers(t, restarted.Handler, "analytics-workers")
+	expected := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{},
+	}
+
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestGroupRemoveStalePersistsDeletionToDisk(t *testing.T) {
+	chdirTemp(t)
+	now := time.Now()
+
+	seedDefaultRegistryFileStore(t, "analytics-workers", map[string]time.Time{
+		"member-a": now.Add(-10 * time.Minute),
+		"member-b": now.Add(-time.Second),
+	})
+
+	srv := newTestServerInCurrentDir(t)
+	response := removeStaleGroupMembers(t, srv.Handler, "analytics-workers", 300000)
+	expectedResponse := groupRemoveStaleResponse{
+		Group:          "analytics-workers",
+		TimeoutMS:      300000,
+		RemovedMembers: []groupMemberResponse{{ID: "member-a"}},
+	}
+
+	if !reflect.DeepEqual(response, expectedResponse) {
+		t.Fatalf("expected %v, got %v", expectedResponse, response)
+	}
+
+	restarted := newTestServerInCurrentDir(t)
+	members := getGroupMembers(t, restarted.Handler, "analytics-workers")
+	expectedMembers := groupMembersResponse{
+		Group:   "analytics-workers",
+		Members: []groupMemberResponse{{ID: "member-b"}},
+	}
+
+	if !reflect.DeepEqual(members, expectedMembers) {
+		t.Fatalf("expected %v, got %v", expectedMembers, members)
+	}
+}
+
+func TestGroupRebalanceAfterRestartUsesPersistedGroupMembers(t *testing.T) {
+	chdirTemp(t)
+
+	srv := newTestServerInCurrentDir(t)
+	joinGroup(t, srv.Handler, "analytics-workers", "member-b")
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+
+	restarted := newTestServerInCurrentDir(t)
+	createTopic(t, restarted.Handler, "orders", 4)
+
+	recorder := rebalanceGroup(t, restarted.Handler, "analytics-workers", "orders")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupRebalanceResponse
+	decodeJSON(t, recorder, &response)
+
+	expected := groupRebalanceResponse{
+		Group: "analytics-workers",
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-a",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0, 1}},
+				},
+			},
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{2, 3}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupCleanupAndRebalanceAfterRestartUsesPersistedMembersAndLastSeen(t *testing.T) {
+	chdirTemp(t)
+	now := time.Now()
+
+	seedDefaultRegistryFileStore(t, "analytics-workers", map[string]time.Time{
+		"member-a": now.Add(-10 * time.Minute),
+		"member-b": now.Add(-time.Second),
+		"member-c": now.Add(-time.Second),
+	})
+
+	srv := newTestServerInCurrentDir(t)
+	createTopic(t, srv.Handler, "orders", 4)
+
+	response := cleanupAndRebalanceGroup(t, srv.Handler, "analytics-workers", "orders", 300000)
+	expected := groupCleanupAndRebalanceResponse{
+		Group:          "analytics-workers",
+		Topic:          "orders",
+		TimeoutMS:      300000,
+		RemovedMembers: []groupMemberResponse{{ID: "member-a"}},
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0, 1}},
+				},
+			},
+			{
+				MemberID: "member-c",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{2, 3}},
+				},
+			},
+		},
 	}
 
 	if !reflect.DeepEqual(response, expected) {
@@ -2479,6 +2673,38 @@ func removeStaleGroupMembers(t *testing.T, handler http.Handler, groupName strin
 	decodeJSON(t, recorder, &response)
 
 	return response
+}
+
+func seedDefaultRegistryFileStore(t *testing.T, groupName string, members map[string]time.Time) {
+	t.Helper()
+
+	registryStore, err := group.NewRegistryFileStore(defaultRegistryStorePath)
+	if err != nil {
+		t.Fatalf("failed to create registry store: %v", err)
+	}
+	if err := registryStore.Load(); err != nil {
+		t.Fatalf("failed to load registry store: %v", err)
+	}
+
+	for memberID, lastSeen := range members {
+		if err := registryStore.Heartbeat(groupName, memberID, lastSeen); err != nil {
+			t.Fatalf("failed to seed registry member %q: %v", memberID, err)
+		}
+	}
+}
+
+func loadDefaultRegistryFileStore(t *testing.T) *group.RegistryFileStore {
+	t.Helper()
+
+	registryStore, err := group.NewRegistryFileStore(defaultRegistryStorePath)
+	if err != nil {
+		t.Fatalf("failed to create registry store: %v", err)
+	}
+	if err := registryStore.Load(); err != nil {
+		t.Fatalf("failed to load registry store: %v", err)
+	}
+
+	return registryStore
 }
 
 func recordRegistryHeartbeat(t *testing.T, registry *group.Registry, groupName string, memberID string, lastSeen time.Time) {

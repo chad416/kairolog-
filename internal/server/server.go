@@ -17,6 +17,7 @@ import (
 const defaultAddr = ":8080"
 const defaultOffsetStorePath = "data/consumer_offsets.log"
 const defaultAssignmentStorePath = "data/group_assignments.log"
+const defaultRegistryStorePath = "data/group_registry.log"
 
 type assignmentStore interface {
 	Save(group string, topic string, assignments []group.Assignment) error
@@ -24,11 +25,20 @@ type assignmentStore interface {
 	Delete(group string, topic string) error
 }
 
+type groupRegistry interface {
+	Join(group string, memberID string) error
+	Heartbeat(group string, memberID string, now time.Time) error
+	Leave(group string, memberID string) error
+	Members(group string) ([]group.GroupMember, error)
+	StaleMembers(group string, now time.Time, timeout time.Duration) ([]group.GroupMember, error)
+	RemoveStaleMembers(group string, now time.Time, timeout time.Duration) ([]group.GroupMember, error)
+}
+
 type Server struct {
 	topicManager    *topic.Manager
 	offsetStore     *consumer.OffsetStore
 	assigner        *group.Assigner
-	registry        *group.Registry
+	registry        groupRegistry
 	assignmentStore assignmentStore
 }
 
@@ -193,15 +203,23 @@ func New() (*http.Server, error) {
 		return nil, fmt.Errorf("load assignment store: %w", err)
 	}
 
-	return newServer(topic.NewManager(), offsetStore, assignmentFileStore), nil
+	registryStore, err := group.NewRegistryFileStore(defaultRegistryStorePath)
+	if err != nil {
+		return nil, fmt.Errorf("create registry store: %w", err)
+	}
+	if err := registryStore.Load(); err != nil {
+		return nil, fmt.Errorf("load registry store: %w", err)
+	}
+
+	return newServer(topic.NewManager(), offsetStore, assignmentFileStore, registryStore), nil
 }
 
-func newServer(topicManager *topic.Manager, offsetStore *consumer.OffsetStore, assignmentStore assignmentStore) *http.Server {
+func newServer(topicManager *topic.Manager, offsetStore *consumer.OffsetStore, assignmentStore assignmentStore, registry groupRegistry) *http.Server {
 	server := &Server{
 		topicManager:    topicManager,
 		offsetStore:     offsetStore,
 		assigner:        group.NewAssigner(),
-		registry:        group.NewRegistry(),
+		registry:        registry,
 		assignmentStore: assignmentStore,
 	}
 
