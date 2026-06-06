@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, saved assignment lookup, saved assignment deletion, server-wired file-backed assignment persistence, server-wired file-backed group registry persistence, group listing support, and background stale-member cleanup.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, saved assignment lookup, saved assignment deletion, server-wired file-backed assignment persistence, server-wired file-backed group registry persistence, group listing support, assignment topic listing support, and background stale-member cleanup.
 
 ## Current Features
 
@@ -47,7 +47,12 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Internal in-memory group assignment store
 * Internal file-backed group assignment store
 * Server-wired file-backed assignment persistence
-* Assignment save, lookup, delete, delete-group, and load operations
+* Assignment save, lookup, delete, delete-group, load, and topic listing operations
+* In-memory `AssignmentStore.Topics(group)` support
+* File-backed `AssignmentFileStore.Topics(group)` support after load/restart
+* Sorted saved-topic listing by consumer group
+* Assignment topic listing reflects `Delete(group, topic)`
+* Assignment topic listing reflects `DeleteGroup(group)`
 * JSONL-based assignment state persistence
 * Assignment persistence after `/groups/rebalance`
 * Assignment persistence after `/groups/cleanup-and-rebalance`
@@ -110,6 +115,7 @@ internal/group
 → assignment engine
 → in-memory assignment store
 → file-backed assignment store
+→ assignment topic listing support
 → in-memory membership registry
 → file-backed membership registry
 → group listing support
@@ -134,6 +140,8 @@ The group registry tracks members joining and leaving consumer groups. The HTTP 
 The group registry tracks `LastSeen` timestamps for members. A member receives a timestamp when it joins, and the heartbeat endpoint updates that timestamp when the member is seen again.
 
 The group registry can list known group names internally through `Groups()`. This is used by the background stale-member cleanup loop to discover all consumer groups.
+
+The assignment store can list saved topics for a consumer group through `Topics(group)`. This is the foundation for automatic rebalance after background stale-member cleanup, because the server must know which saved group/topic assignments need recalculation.
 
 The group registry can detect stale members by comparing each member’s `LastSeen` timestamp against a timeout window. The HTTP broker exposes detection through `GET /groups/stale`.
 
@@ -959,11 +967,27 @@ Internal API:
 NewAssignmentStore()
 Save(group, topic, assignments)
 Get(group, topic)
+Topics(group)
 Delete(group, topic)
 DeleteGroup(group)
 ```
 
-The server can still use the in-memory assignment store in tests because the server depends on an assignment store interface.
+In-memory assignment store behavior:
+
+```text
+Save → stores/replaces latest assignments for group/topic
+Get → returns assignments and found=true when present
+Get → returns found=false when missing
+Topics → returns sorted topic names with saved assignments for one group
+Delete → removes one group/topic assignment
+DeleteGroup → removes all assignments for one group
+```
+
+`Topics(group)` returns an empty slice when a group has no saved assignments.
+
+`Topics(group)` validates that the group name is not empty.
+
+The server can use the in-memory assignment store in tests because the server depends on an assignment store interface.
 
 ## File-Backed Assignment Store
 
@@ -975,6 +999,7 @@ Internal API:
 NewAssignmentFileStore(path)
 Save(group, topic, assignments)
 Get(group, topic)
+Topics(group)
 Delete(group, topic)
 DeleteGroup(group)
 Load()
@@ -986,6 +1011,7 @@ File-backed store behavior:
 Save → stores/replaces latest assignments for group/topic and writes state to disk
 Get → returns assignments and found=true when present
 Get → returns found=false when missing
+Topics → returns sorted topic names with saved assignments for one group
 Delete → removes one group/topic assignment and writes updated state to disk
 DeleteGroup → removes all assignments for one group and writes updated state to disk
 Load → restores assignment state from disk
@@ -1017,6 +1043,53 @@ The HTTP server uses the file-backed assignment store by default at:
 
 ```text
 data/group_assignments.log
+```
+
+`Topics(group)` works after `Load()` and reflects persisted deletion after restart.
+
+## Assignment Topic Listing Support
+
+Both assignment store implementations support internal topic listing:
+
+```text
+AssignmentStore.Topics(group)
+AssignmentFileStore.Topics(group)
+```
+
+Behavior:
+
+```text
+returns all saved topic names for one group
+returns topic names sorted alphabetically
+returns empty slice when the group has no saved assignments
+returns only topics for the requested group
+excludes deleted group/topic assignments
+reflects Delete(group, topic)
+reflects DeleteGroup(group)
+works after AssignmentFileStore.Load()
+rejects empty group
+```
+
+This is mainly a foundation for the next planned feature:
+
+```text
+automatic rebalance after background stale-member cleanup
+```
+
+The future automatic rebalance flow needs this because stale cleanup only knows the group. To recalculate assignments, the server also needs to know which topics that group has saved assignments for.
+
+Planned flow:
+
+```text
+background cleanup tick
+→ registry.Groups()
+→ for each group:
+   → registry.RemoveStaleMembers(group, now, timeout)
+   → if members were removed:
+      → assignmentStore.Topics(group)
+      → for each saved topic:
+         → recalculate assignments for remaining active members
+         → save updated assignment state
 ```
 
 ## In-Memory Group Registry
@@ -1150,7 +1223,7 @@ every interval
 
 ## Background Stale-Member Cleanup
 
-The server now has a background stale-member cleanup loop.
+The server has a background stale-member cleanup loop.
 
 Purpose:
 
@@ -1311,6 +1384,7 @@ member leaves group
 member heartbeat is recorded
 current members can be listed
 known group names can be listed internally
+saved topics for a group can be listed internally
 stale members can be detected
 stale members can be removed manually
 stale members can be removed automatically in the background
@@ -1481,6 +1555,8 @@ Completed core areas:
 * Saved assignment lookup endpoint
 * Saved assignment delete endpoint
 * Assignment file load/reload support
+* Assignment topic listing support
+* File-backed assignment topic listing after load/restart
 * Assignment persistence tests
 * Server restart persistence tests for assignment state
 * Internal in-memory group registry
