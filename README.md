@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, internal assignment state storage, saved assignment lookup, and saved assignment deletion.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, in-memory assignment state storage, saved assignment lookup, saved assignment deletion, and a file-backed assignment store foundation.
 
 ## Current Features
 
@@ -52,7 +52,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * HTTP stale group member removal
 * HTTP group rebalance calculation
 * HTTP cleanup-and-rebalance flow
-* Internal group assignment store
+* Internal in-memory group assignment store
 * In-memory assignment storage by group/topic
 * Assignment save, lookup, delete, and delete-group operations
 * Deep-copy protection for stored assignments
@@ -60,6 +60,11 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Server-wired assignment storage after cleanup-and-rebalance
 * HTTP lookup for latest saved group/topic assignment state
 * HTTP deletion for latest saved group/topic assignment state
+* Internal file-backed assignment store foundation
+* File-backed assignment save, lookup, delete, delete-group, and load operations
+* JSONL-based assignment state persistence
+* Automatic parent directory creation for assignment state files
+* Assignment file reload support after restart
 * Topic manager
 * Partition manager
 * Topic partitions wired to partition logs
@@ -83,9 +88,15 @@ server
 → stale member removal
 → group rebalance calculation
 → cleanup-and-rebalance flow
-→ assignment store
+→ in-memory assignment store
 → saved assignment lookup
 → saved assignment deletion
+
+internal/group
+→ assignment engine
+→ membership registry
+→ in-memory assignment store
+→ file-backed assignment store
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -108,13 +119,15 @@ The group registry can detect stale members by comparing each member’s `LastSe
 
 The group registry can remove stale members. The HTTP broker exposes stale-member removal through `POST /groups/remove-stale`.
 
-The rebalance endpoint calculates topic partition assignments using the currently registered group members, then saves the latest assignment state into the internal assignment store.
+The rebalance endpoint calculates topic partition assignments using the currently registered group members, then saves the latest assignment state into the server’s assignment store.
 
-The cleanup-and-rebalance endpoint removes stale members first, calculates fresh assignments for the remaining active members, then saves the latest assignment state into the internal assignment store.
+The cleanup-and-rebalance endpoint removes stale members first, calculates fresh assignments for the remaining active members, then saves the latest assignment state into the server’s assignment store.
 
 The saved assignment lookup endpoint reads the latest stored assignment state for a group/topic pair.
 
 The saved assignment delete endpoint removes the saved assignment state for a group/topic pair without deleting group membership, offsets, or topic data.
+
+The file-backed assignment store currently exists inside `internal/group`. It is tested and can persist assignment state to disk, but it is not wired into the HTTP server yet.
 
 ## Storage Layout
 
@@ -139,7 +152,13 @@ Index files store offset-to-byte-position mappings.
 
 The consumer offset file stores committed offsets for consumer groups.
 
-Current group membership, heartbeat state, stale-member detection, stale-member removal state, rebalance assignments, cleanup-and-rebalance assignments, and assignment store state are in-memory only and are not persisted to disk yet.
+The file-backed assignment store can persist assignment state to a file such as:
+
+```text
+data/group_assignments.log
+```
+
+Current HTTP server assignment state is still in-memory only until the file-backed assignment store is wired into the server.
 
 ## API
 
@@ -379,7 +398,7 @@ Example response:
 }
 ```
 
-The rebalance endpoint reads the currently registered members from the group registry, calculates topic partition assignments for those members, and saves the latest assignment result into the internal assignment store.
+The rebalance endpoint reads the currently registered members from the group registry, calculates topic partition assignments for those members, and saves the latest assignment result into the server assignment store.
 
 Current rebalance behavior:
 
@@ -391,7 +410,7 @@ registered group members
 → save latest assignment state by group/topic
 ```
 
-This endpoint does not commit offsets, remove stale members, persist assignments to disk, or trigger background rebalancing.
+This endpoint does not commit offsets, remove stale members, persist assignments to disk yet, or trigger background rebalancing.
 
 ### Cleanup and Rebalance Consumer Group
 
@@ -452,7 +471,7 @@ now - LastSeen > timeout
 
 If all members are stale and removed, the endpoint returns `400 Bad Request` because there are no remaining active members to receive assignments.
 
-This endpoint does not persist assignments to disk, commit offsets, expose `LastSeen`, or run as a background cleanup process.
+This endpoint does not persist assignments to disk yet, commit offsets, expose `LastSeen`, or run as a background cleanup process.
 
 ### Get Saved Consumer Group Assignments
 
@@ -501,7 +520,7 @@ Example response when not found:
 }
 ```
 
-This endpoint reads the latest saved assignment result from the internal assignment store.
+This endpoint reads the latest saved assignment result from the server assignment store.
 
 It returns `found: true` when assignments exist for the requested group/topic pair.
 
@@ -771,8 +790,8 @@ DELETE /groups/assignments?group=analytics-workers&topic=orders
 Current rebalance limits:
 
 ```text
-assignments are stored in memory only
-assignments are not persisted to disk
+assignments are stored in memory only through the HTTP server
+server assignments are not persisted to disk yet
 stale members are not removed inside /groups/rebalance
 offsets are not committed during rebalance
 background rebalance is not triggered
@@ -832,17 +851,17 @@ DELETE /groups/assignments?group=analytics-workers&topic=orders
 Current cleanup-and-rebalance limits:
 
 ```text
-assignments are stored in memory only
-assignments are not persisted to disk
+assignments are stored in memory only through the HTTP server
+server assignments are not persisted to disk yet
 offsets are not committed
 LastSeen is not exposed in HTTP responses
 cleanup runs only when the endpoint is called
 there is no background cleanup loop yet
 ```
 
-## Assignment Store
+## In-Memory Assignment Store
 
-The assignment store keeps the latest assignment result for a group/topic pair.
+The in-memory assignment store keeps the latest assignment result for a group/topic pair during the current process lifetime.
 
 Internal API:
 
@@ -868,31 +887,71 @@ The assignment store is concurrency-safe and uses an internal `sync.RWMutex`.
 
 Assignments are deep-copied when saved and deep-copied again when fetched. This prevents outside mutation from corrupting store state.
 
-Example:
+The HTTP server currently uses this in-memory store for assignment state.
+
+## File-Backed Assignment Store
+
+The file-backed assignment store persists the latest assignment state for group/topic pairs to disk.
+
+Internal API:
 
 ```text
-group: analytics-workers
-topic: orders
-
-member-a → partitions 0, 1
-member-b → partitions 2, 3
+NewAssignmentFileStore(path)
+Save(group, topic, assignments)
+Get(group, topic)
+Delete(group, topic)
+DeleteGroup(group)
+Load()
 ```
 
-Stored as:
+File-backed store behavior:
 
 ```text
-analytics-workers/orders
-→ latest assignment result
+Save → stores/replaces latest assignments for group/topic and writes state to disk
+Get → returns assignments and found=true when present
+Get → returns found=false when missing
+Delete → removes one group/topic assignment and writes updated state to disk
+DeleteGroup → removes all assignments for one group and writes updated state to disk
+Load → restores assignment state from disk
 ```
 
-The HTTP server currently supports reading and deleting saved assignments through `/groups/assignments`.
+The file-backed assignment store uses a simple JSON Lines format.
 
-Current assignment store limits:
+Example record:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders",
+  "assignments": [
+    {
+      "member_id": "member-a",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [0, 1]
+        }
+      ]
+    }
+  ]
+}
+```
+
+The file-backed assignment store is concurrency-safe and uses an internal `sync.RWMutex`.
+
+Assignments are deep-copied on save and get.
+
+Parent directories are created automatically.
+
+A missing assignment file is treated as empty state.
+
+Current file-backed assignment store limits:
 
 ```text
-in-memory only
-not persisted to disk
-DeleteGroup is internal only and not exposed through HTTP yet
+implemented and tested inside internal/group
+not wired into the HTTP server yet
+does not persist group membership
+does not persist heartbeat state
 does not commit offsets
 does not trigger rebalance by itself
 ```
@@ -1031,6 +1090,12 @@ Run all tests:
 go test ./...
 ```
 
+Run group package tests only:
+
+```bash
+go test ./internal/group
+```
+
 If Windows Application Control or antivirus blocks temporary Go test executables, compile a package separately:
 
 ```bash
@@ -1065,15 +1130,19 @@ Completed core areas:
 * Stale group member removal endpoint
 * Group rebalance endpoint
 * Cleanup-and-rebalance endpoint
-* Internal assignment store
+* Internal in-memory assignment store
 * Server-wired assignment store saving after rebalance
 * Server-wired assignment store saving after cleanup-and-rebalance
 * Saved assignment lookup endpoint
 * Saved assignment delete endpoint
+* Internal file-backed assignment store
+* Assignment file load/reload support
+* Assignment persistence tests
 
 Still planned:
 
-* Persist assignment state to disk
+* Wire file-backed assignment store into the HTTP server
+* Persist server assignment state to disk
 * Persistent group membership and heartbeat state
 * Background stale-member cleanup loop
 * Stronger crash recovery beyond missing-index rebuild
