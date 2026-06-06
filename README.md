@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, and internal assignment state storage.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, internal assignment state storage, and saved assignment lookup.
 
 ## Current Features
 
@@ -17,6 +17,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Consumer group assignment endpoint (`POST /groups/assign`)
 * Consumer group rebalance endpoint (`POST /groups/rebalance`)
 * Consumer group cleanup-and-rebalance endpoint (`POST /groups/cleanup-and-rebalance`)
+* Consumer group saved assignment lookup endpoint (`GET /groups/assignments`)
 * Consumer group join endpoint (`POST /groups/join`)
 * Consumer group leave endpoint (`POST /groups/leave`)
 * Consumer group heartbeat endpoint (`POST /groups/heartbeat`)
@@ -56,6 +57,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Deep-copy protection for stored assignments
 * Server-wired assignment storage after rebalance
 * Server-wired assignment storage after cleanup-and-rebalance
+* HTTP lookup for latest saved group/topic assignment state
 * Topic manager
 * Partition manager
 * Topic partitions wired to partition logs
@@ -80,6 +82,7 @@ server
 → group rebalance calculation
 → cleanup-and-rebalance flow
 → assignment store
+→ saved assignment lookup
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -106,7 +109,7 @@ The rebalance endpoint calculates topic partition assignments using the currentl
 
 The cleanup-and-rebalance endpoint removes stale members first, calculates fresh assignments for the remaining active members, then saves the latest assignment state into the internal assignment store.
 
-The internal assignment store keeps the latest calculated assignments for each group/topic pair. It is currently in-memory only and is not exposed through a lookup HTTP endpoint yet.
+The saved assignment lookup endpoint reads the latest stored assignment state for a group/topic pair.
 
 ## Storage Layout
 
@@ -446,6 +449,61 @@ If all members are stale and removed, the endpoint returns `400 Bad Request` bec
 
 This endpoint does not persist assignments to disk, commit offsets, expose `LastSeen`, or run as a background cleanup process.
 
+### Get Saved Consumer Group Assignments
+
+```http
+GET /groups/assignments?group=analytics-workers&topic=orders
+```
+
+Example response when found:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders",
+  "found": true,
+  "assignments": [
+    {
+      "member_id": "member-a",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [0, 1]
+        }
+      ]
+    },
+    {
+      "member_id": "member-b",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [2, 3]
+        }
+      ]
+    }
+  ]
+}
+```
+
+Example response when not found:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders",
+  "found": false,
+  "assignments": []
+}
+```
+
+This endpoint reads the latest saved assignment result from the internal assignment store.
+
+It returns `found: true` when assignments exist for the requested group/topic pair.
+
+It returns `found: false` when no assignment has been saved for that group/topic pair.
+
+This endpoint does not calculate a new assignment, remove stale members, commit offsets, or mutate stored state.
+
 ### Join Consumer Group
 
 ```http
@@ -671,12 +729,17 @@ analytics-workers/orders
 → latest assignment result
 ```
 
+The saved result can be read through:
+
+```http
+GET /groups/assignments?group=analytics-workers&topic=orders
+```
+
 Current rebalance limits:
 
 ```text
 assignments are stored in memory only
 assignments are not persisted to disk
-saved assignments are not exposed through HTTP yet
 stale members are not removed inside /groups/rebalance
 offsets are not committed during rebalance
 background rebalance is not triggered
@@ -721,12 +784,17 @@ analytics-workers/orders
 → latest assignment result after cleanup
 ```
 
+The saved result can be read through:
+
+```http
+GET /groups/assignments?group=analytics-workers&topic=orders
+```
+
 Current cleanup-and-rebalance limits:
 
 ```text
 assignments are stored in memory only
 assignments are not persisted to disk
-saved assignments are not exposed through HTTP yet
 offsets are not committed
 LastSeen is not exposed in HTTP responses
 cleanup runs only when the endpoint is called
@@ -778,12 +846,14 @@ analytics-workers/orders
 → latest assignment result
 ```
 
+The HTTP server currently supports reading saved assignments through `GET /groups/assignments`.
+
 Current assignment store limits:
 
 ```text
 in-memory only
 not persisted to disk
-not exposed through HTTP lookup yet
+delete is internal only and not exposed through HTTP yet
 does not commit offsets
 does not trigger rebalance by itself
 ```
@@ -811,6 +881,7 @@ stale members can be removed
 registered active members can be rebalanced
 stale members can be removed and remaining members rebalanced in one request
 latest assignments can be stored internally by group/topic
+latest saved assignments can be read through HTTP
 duplicate joins are idempotent
 leaving a missing member is idempotent
 heartbeat for a missing member creates the member
@@ -957,10 +1028,11 @@ Completed core areas:
 * Internal assignment store
 * Server-wired assignment store saving after rebalance
 * Server-wired assignment store saving after cleanup-and-rebalance
+* Saved assignment lookup endpoint
 
 Still planned:
 
-* Expose saved assignments through HTTP
+* Delete saved assignments through HTTP
 * Persist assignment state to disk
 * Persistent group membership and heartbeat state
 * Background stale-member cleanup loop
