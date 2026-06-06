@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, saved assignment lookup, saved assignment deletion, server-wired file-backed assignment persistence, and server-wired file-backed group registry persistence.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, saved assignment lookup, saved assignment deletion, server-wired file-backed assignment persistence, server-wired file-backed group registry persistence, and group listing support for future background cleanup.
 
 ## Current Features
 
@@ -56,7 +56,11 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Internal in-memory group registry
 * Internal file-backed group registry
 * Server-wired file-backed group registry persistence
-* File-backed `Join`, `Heartbeat`, `Leave`, `Members`, `State`, `StaleMembers`, and `RemoveStaleMembers`
+* File-backed `Join`, `Heartbeat`, `Leave`, `Members`, `Groups`, `State`, `StaleMembers`, and `RemoveStaleMembers`
+* In-memory `Groups()` support for known consumer group discovery
+* File-backed `Groups()` support after load/restart
+* Sorted group name listing
+* Empty/deleted group exclusion from group listings
 * JSONL-based group registry persistence
 * Group membership reload after server restart
 * LastSeen heartbeat reload after server restart
@@ -86,6 +90,7 @@ server
 → group assignment engine
 → group registry interface
 → file-backed group registry
+→ group listing support
 → heartbeat tracking
 → stale member detection
 → stale member removal
@@ -104,6 +109,7 @@ internal/group
 → file-backed assignment store
 → in-memory membership registry
 → file-backed membership registry
+→ group listing support
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -118,11 +124,13 @@ Consumer offsets are stored separately so a consumer group can remember how far 
 
 The group assignment engine distributes topic partitions across consumer group members in a deterministic and balanced way. The HTTP broker exposes direct assignment through `POST /groups/assign`.
 
-The server now uses a file-backed group registry as the default registry. Group membership and `LastSeen` heartbeat state are saved to disk at `data/group_registry.log` and loaded again when the server starts.
+The server uses a file-backed group registry as the default registry. Group membership and `LastSeen` heartbeat state are saved to disk at `data/group_registry.log` and loaded again when the server starts.
 
 The group registry tracks members joining and leaving consumer groups. The HTTP broker exposes this through `POST /groups/join`, `POST /groups/leave`, and `GET /groups/members`.
 
 The group registry tracks `LastSeen` timestamps for members. A member receives a timestamp when it joins, and the heartbeat endpoint updates that timestamp when the member is seen again.
+
+The group registry can now list known group names internally through `Groups()`. This is not exposed as a public HTTP endpoint yet. It exists so internal server logic can discover all groups, which is required for future background stale-member cleanup.
 
 The group registry can detect stale members by comparing each member’s `LastSeen` timestamp against a timeout window. The HTTP broker exposes detection through `GET /groups/stale`.
 
@@ -428,7 +436,7 @@ registered group members
 → persist assignment state to data/group_assignments.log
 ```
 
-Because the server now uses the file-backed registry, rebalance can use persisted group members after server restart.
+Because the server uses the file-backed registry, rebalance can use persisted group members after server restart.
 
 This endpoint does not commit offsets, remove stale members, or trigger background rebalancing.
 
@@ -490,7 +498,7 @@ A member is removed when:
 now - LastSeen > timeout
 ```
 
-Because the server now uses the file-backed registry, cleanup-and-rebalance can use persisted members and persisted `LastSeen` timestamps after restart.
+Because the server uses the file-backed registry, cleanup-and-rebalance can use persisted members and persisted `LastSeen` timestamps after restart.
 
 If all members are stale and removed, the endpoint returns `400 Bad Request` because there are no remaining active members to receive assignments.
 
@@ -1017,10 +1025,26 @@ Join(group, memberID)
 Heartbeat(group, memberID, now)
 Leave(group, memberID)
 Members(group)
+Groups()
 State(group)
 StaleMembers(group, now, timeout)
 RemoveStaleMembers(group, now, timeout)
 ```
+
+In-memory registry behavior:
+
+```text
+Join → adds member and sets LastSeen for new members
+Heartbeat → updates LastSeen and creates missing members
+Leave → removes a member
+Members → returns sorted members for one group
+Groups → returns sorted known group names
+State → returns group name and sorted members
+StaleMembers → returns stale members without mutating state
+RemoveStaleMembers → removes stale members
+```
+
+`Groups()` returns sorted group names and excludes empty/deleted groups.
 
 The server can still use the in-memory registry in tests because the server depends on a group registry interface.
 
@@ -1036,6 +1060,7 @@ Join(group, memberID)
 Heartbeat(group, memberID, now)
 Leave(group, memberID)
 Members(group)
+Groups()
 State(group)
 StaleMembers(group, now, timeout)
 RemoveStaleMembers(group, now, timeout)
@@ -1049,6 +1074,7 @@ Join → adds member and persists registry state
 Heartbeat → updates LastSeen and persists registry state
 Leave → removes member and persists registry state
 Members → returns sorted group members
+Groups → returns sorted known group names
 State → returns group name and sorted members
 StaleMembers → returns stale members without mutating state
 RemoveStaleMembers → removes stale members and persists registry state
@@ -1075,12 +1101,51 @@ data/group_registry.log
 
 Records are persisted deterministically by sorted group and sorted member ID.
 
+`Groups()` works after `Load()` and reflects persisted deletion after restart.
+
 Current file-backed registry limits:
 
 ```text
 does not expose LastSeen through HTTP responses yet
+does not expose Groups through HTTP yet
 does not trigger rebalance by itself
 does not commit offsets
+```
+
+## Group Listing Support
+
+Both registry implementations now support internal group listing:
+
+```text
+Registry.Groups()
+RegistryFileStore.Groups()
+```
+
+Behavior:
+
+```text
+returns all known group names
+returns group names sorted alphabetically
+returns empty slice when no groups exist
+excludes groups with no members
+reflects Leave deletion
+reflects RemoveStaleMembers deletion
+works after RegistryFileStore.Load()
+```
+
+This is mainly a foundation for the next planned feature:
+
+```text
+background stale-member cleanup loop
+```
+
+The cleanup loop will need to discover all groups:
+
+```text
+every interval
+→ registry.Groups()
+→ for each group
+→ registry.RemoveStaleMembers(group, now, timeout)
 ```
 
 ## Server Persistent State Wiring
@@ -1160,6 +1225,7 @@ member joins group
 member leaves group
 member heartbeat is recorded
 current members can be listed
+known group names can be listed internally
 stale members can be detected
 stale members can be removed
 registered active members can be rebalanced
@@ -1333,6 +1399,8 @@ Completed core areas:
 * Internal file-backed group registry
 * Group registry interface inside server
 * Server-wired file-backed group registry persistence
+* Registry group listing support
+* File-backed group listing support after load/restart
 * File-backed group membership persistence tests
 * File-backed heartbeat persistence tests
 * File-backed stale-member removal persistence tests
