@@ -1355,6 +1355,125 @@ func TestGroupAssignmentsDeleteWithNilAssignmentStoreReturnsInternalServerError(
 	}
 }
 
+func TestNewWiresFileBackedAssignmentStore(t *testing.T) {
+	chdirTemp(t)
+
+	srv := newTestServerInCurrentDir(t)
+	if srv == nil {
+		t.Fatal("expected server")
+	}
+
+	if _, err := os.Stat(defaultAssignmentStorePath); err != nil {
+		t.Fatalf("expected assignment store file to exist: %v", err)
+	}
+}
+
+func TestGroupAssignmentsSavedThroughRebalanceSurviveServerRestart(t *testing.T) {
+	chdirTemp(t)
+
+	srv := newTestServerInCurrentDir(t)
+	createTopic(t, srv.Handler, "orders", 4)
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	joinGroup(t, srv.Handler, "analytics-workers", "member-b")
+
+	recorder := rebalanceGroup(t, srv.Handler, "analytics-workers", "orders")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	restarted := newTestServerInCurrentDir(t)
+	response := getGroupAssignments(t, restarted.Handler, "analytics-workers", "orders")
+	expected := groupAssignmentsResponse{
+		Group: "analytics-workers",
+		Topic: "orders",
+		Found: true,
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-a",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0, 1}},
+				},
+			},
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{2, 3}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupAssignmentsSavedThroughCleanupAndRebalanceSurviveServerRestart(t *testing.T) {
+	chdirTemp(t)
+
+	srv := newTestServerInCurrentDir(t)
+	createTopic(t, srv.Handler, "orders", 4)
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	joinGroup(t, srv.Handler, "analytics-workers", "member-b")
+
+	cleanupAndRebalanceGroup(t, srv.Handler, "analytics-workers", "orders", 300000)
+
+	restarted := newTestServerInCurrentDir(t)
+	response := getGroupAssignments(t, restarted.Handler, "analytics-workers", "orders")
+	expected := groupAssignmentsResponse{
+		Group: "analytics-workers",
+		Topic: "orders",
+		Found: true,
+		Assignments: []groupAssignmentResponse{
+			{
+				MemberID: "member-a",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{0, 1}},
+				},
+			},
+			{
+				MemberID: "member-b",
+				Topics: []groupTopicAssignmentResponse{
+					{Topic: "orders", Partitions: []int{2, 3}},
+				},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupAssignmentsDeletePersistsDeletionToDisk(t *testing.T) {
+	chdirTemp(t)
+
+	srv := newTestServerInCurrentDir(t)
+	createTopic(t, srv.Handler, "orders", 4)
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	joinGroup(t, srv.Handler, "analytics-workers", "member-b")
+
+	recorder := rebalanceGroup(t, srv.Handler, "analytics-workers", "orders")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	deleteGroupAssignments(t, srv.Handler, "analytics-workers", "orders")
+
+	restarted := newTestServerInCurrentDir(t)
+	response := getGroupAssignments(t, restarted.Handler, "analytics-workers", "orders")
+	expected := groupAssignmentsResponse{
+		Group:       "analytics-workers",
+		Topic:       "orders",
+		Found:       false,
+		Assignments: []groupAssignmentResponse{},
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
 func TestGroupJoin(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -2086,6 +2205,12 @@ func TestGroupMembershipRejectsWrongMethods(t *testing.T) {
 func newTestServer(t *testing.T) *http.Server {
 	t.Helper()
 	chdirTemp(t)
+
+	return newTestServerInCurrentDir(t)
+}
+
+func newTestServerInCurrentDir(t *testing.T) *http.Server {
+	t.Helper()
 
 	srv, err := New()
 	if err != nil {

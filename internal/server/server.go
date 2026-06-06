@@ -16,13 +16,20 @@ import (
 
 const defaultAddr = ":8080"
 const defaultOffsetStorePath = "data/consumer_offsets.log"
+const defaultAssignmentStorePath = "data/group_assignments.log"
+
+type assignmentStore interface {
+	Save(group string, topic string, assignments []group.Assignment) error
+	Get(group string, topic string) ([]group.Assignment, bool, error)
+	Delete(group string, topic string) error
+}
 
 type Server struct {
 	topicManager    *topic.Manager
 	offsetStore     *consumer.OffsetStore
 	assigner        *group.Assigner
 	registry        *group.Registry
-	assignmentStore *group.AssignmentStore
+	assignmentStore assignmentStore
 }
 
 type healthResponse struct {
@@ -178,23 +185,24 @@ func New() (*http.Server, error) {
 		return nil, fmt.Errorf("create offset store: %w", err)
 	}
 
-	return newServer(topic.NewManager(), offsetStore), nil
-}
-
-func newServer(topicManager *topic.Manager, offsetStores ...*consumer.OffsetStore) *http.Server {
-	var offsetStore *consumer.OffsetStore
-	if len(offsetStores) > 0 {
-		offsetStore = offsetStores[0]
-	} else {
-		offsetStore, _ = consumer.NewOffsetStore(defaultOffsetStorePath)
+	assignmentFileStore, err := group.NewAssignmentFileStore(defaultAssignmentStorePath)
+	if err != nil {
+		return nil, fmt.Errorf("create assignment store: %w", err)
+	}
+	if err := assignmentFileStore.Load(); err != nil {
+		return nil, fmt.Errorf("load assignment store: %w", err)
 	}
 
+	return newServer(topic.NewManager(), offsetStore, assignmentFileStore), nil
+}
+
+func newServer(topicManager *topic.Manager, offsetStore *consumer.OffsetStore, assignmentStore assignmentStore) *http.Server {
 	server := &Server{
 		topicManager:    topicManager,
 		offsetStore:     offsetStore,
 		assigner:        group.NewAssigner(),
 		registry:        group.NewRegistry(),
-		assignmentStore: group.NewAssignmentStore(),
+		assignmentStore: assignmentStore,
 	}
 
 	return &http.Server{
