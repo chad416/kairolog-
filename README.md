@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, saved assignment lookup, saved assignment deletion, server-wired file-backed assignment persistence, server-wired file-backed group registry persistence, and group listing support for future background cleanup.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, saved assignment lookup, saved assignment deletion, server-wired file-backed assignment persistence, server-wired file-backed group registry persistence, group listing support, and background stale-member cleanup.
 
 ## Current Features
 
@@ -25,6 +25,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Consumer group members endpoint (`GET /groups/members`)
 * Stale group members endpoint (`GET /groups/stale`)
 * Stale group member removal endpoint (`POST /groups/remove-stale`)
+* Background stale-member cleanup loop
 * In-memory log component
 * File-based storage component
 * Offset-aware records
@@ -70,6 +71,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Stale-member removal persistence after `/groups/remove-stale`
 * Rebalance support using persisted group members after restart
 * Cleanup-and-rebalance support using persisted members and `LastSeen` after restart
+* Automatic stale-member cleanup using registered group discovery
 * Automatic parent directory creation for persistent state files
 * Topic manager
 * Partition manager
@@ -93,7 +95,8 @@ server
 → group listing support
 → heartbeat tracking
 → stale member detection
-→ stale member removal
+→ manual stale member removal
+→ background stale member cleanup
 → group rebalance calculation
 → cleanup-and-rebalance flow
 → assignment store interface
@@ -130,11 +133,13 @@ The group registry tracks members joining and leaving consumer groups. The HTTP 
 
 The group registry tracks `LastSeen` timestamps for members. A member receives a timestamp when it joins, and the heartbeat endpoint updates that timestamp when the member is seen again.
 
-The group registry can now list known group names internally through `Groups()`. This is not exposed as a public HTTP endpoint yet. It exists so internal server logic can discover all groups, which is required for future background stale-member cleanup.
+The group registry can list known group names internally through `Groups()`. This is used by the background stale-member cleanup loop to discover all consumer groups.
 
 The group registry can detect stale members by comparing each member’s `LastSeen` timestamp against a timeout window. The HTTP broker exposes detection through `GET /groups/stale`.
 
-The group registry can remove stale members. The HTTP broker exposes stale-member removal through `POST /groups/remove-stale`.
+The group registry can remove stale members manually through `POST /groups/remove-stale`.
+
+The server also runs a background stale-member cleanup loop from the production `Start()` path. This loop periodically discovers all groups and removes stale members automatically.
 
 The rebalance endpoint calculates topic partition assignments using the currently registered group members, then saves the latest assignment state into the server’s file-backed assignment store.
 
@@ -502,7 +507,7 @@ Because the server uses the file-backed registry, cleanup-and-rebalance can use 
 
 If all members are stale and removed, the endpoint returns `400 Bad Request` because there are no remaining active members to receive assignments.
 
-This endpoint does not commit offsets, expose `LastSeen`, or run as a background cleanup process.
+This endpoint does not commit offsets, expose `LastSeen`, or run as the background cleanup mechanism. It is a manual cleanup-and-rebalance request.
 
 ### Get Saved Consumer Group Assignments
 
@@ -867,8 +872,8 @@ Current rebalance limits:
 
 ```text
 stale members are not removed inside /groups/rebalance
+background stale cleanup does not trigger rebalance yet
 offsets are not committed during rebalance
-background rebalance is not triggered
 ```
 
 ## Cleanup and Rebalance Flow
@@ -939,8 +944,9 @@ Current cleanup-and-rebalance limits:
 ```text
 offsets are not committed
 LastSeen is not exposed in HTTP responses
-cleanup runs only when the endpoint is called
-there is no background cleanup loop yet
+cleanup-and-rebalance runs only when the endpoint is called
+background cleanup removes stale members only
+background cleanup does not calculate new assignments yet
 ```
 
 ## In-Memory Assignment Store
@@ -1114,7 +1120,7 @@ does not commit offsets
 
 ## Group Listing Support
 
-Both registry implementations now support internal group listing:
+Both registry implementations support internal group listing:
 
 ```text
 Registry.Groups()
@@ -1133,19 +1139,84 @@ reflects RemoveStaleMembers deletion
 works after RegistryFileStore.Load()
 ```
 
-This is mainly a foundation for the next planned feature:
-
-```text
-background stale-member cleanup loop
-```
-
-The cleanup loop will need to discover all groups:
+This is used by the background stale-member cleanup loop:
 
 ```text
 every interval
 → registry.Groups()
 → for each group
 → registry.RemoveStaleMembers(group, now, timeout)
+```
+
+## Background Stale-Member Cleanup
+
+The server now has a background stale-member cleanup loop.
+
+Purpose:
+
+```text
+periodically discover all consumer groups
+remove stale members automatically
+persist the cleanup result through RegistryFileStore
+```
+
+Default values:
+
+```text
+defaultStaleCleanupInterval = 1 minute
+defaultStaleMemberTimeout = 5 minutes
+```
+
+One cleanup pass:
+
+```text
+cleanupStaleMembersOnce(registry, now, timeout)
+→ validate registry, now, and timeout
+→ groups = registry.Groups()
+→ for each group:
+   → registry.RemoveStaleMembers(group, now, timeout)
+```
+
+Background loop:
+
+```text
+startStaleMemberCleanup(ctx, registry, interval, timeout)
+→ create ticker
+→ on each tick:
+   → run cleanupStaleMembersOnce(...)
+→ stop when context is cancelled
+```
+
+Production startup behavior:
+
+```text
+Start()
+→ create configured server
+→ create cancellable context
+→ register cancellation on server shutdown
+→ start background stale-member cleanup
+→ run ListenAndServe
+```
+
+Test-safe behavior:
+
+```text
+New()
+→ creates server dependencies
+→ does not start background goroutines
+```
+
+This prevents tests that call `New()` from leaking cleanup goroutines.
+
+Current background cleanup limits:
+
+```text
+removes stale members only
+does not trigger rebalance automatically
+does not modify assignment state
+does not commit offsets
+does not expose new HTTP endpoints
+does not expose LastSeen in HTTP responses
 ```
 
 ## Server Persistent State Wiring
@@ -1160,6 +1231,15 @@ New()
 → create file-backed group registry at data/group_registry.log
 → load registry state from disk
 → wire assignment store and registry into server
+```
+
+Production server startup behavior:
+
+```text
+Start()
+→ build configured server
+→ start background stale-member cleanup loop
+→ run HTTP server
 ```
 
 This allows:
@@ -1194,6 +1274,10 @@ GET /groups/stale
 
 POST /groups/remove-stale
 → persist stale-member deletion
+
+background cleanup loop
+→ automatically remove stale members
+→ persist registry cleanup state
 ```
 
 Restart behavior:
@@ -1205,6 +1289,7 @@ server starts
 → saved assignment state becomes queryable again
 → group membership becomes queryable again
 → LastSeen timestamps become available for stale-member logic
+→ background stale cleanup can continue from persisted registry state
 ```
 
 ## Consumer Group Membership
@@ -1227,7 +1312,8 @@ member heartbeat is recorded
 current members can be listed
 known group names can be listed internally
 stale members can be detected
-stale members can be removed
+stale members can be removed manually
+stale members can be removed automatically in the background
 registered active members can be rebalanced
 stale members can be removed and remaining members rebalanced in one request
 latest assignments can be stored internally by group/topic
@@ -1332,9 +1418,11 @@ removed: member-a, member-c
 remaining: member-b
 ```
 
-Stale member removal is implemented inside the group registry and exposed through `POST /groups/remove-stale`.
+Stale member removal is exposed manually through `POST /groups/remove-stale`.
 
-Stale member removal does not trigger background rebalancing yet.
+Stale member removal also runs automatically through the background cleanup loop.
+
+Automatic stale member removal does not trigger background rebalancing yet.
 
 ## Running Tests
 
@@ -1401,6 +1489,9 @@ Completed core areas:
 * Server-wired file-backed group registry persistence
 * Registry group listing support
 * File-backed group listing support after load/restart
+* Background stale-member cleanup loop
+* Deterministic one-pass stale cleanup helper
+* Background cleanup lifecycle tests
 * File-backed group membership persistence tests
 * File-backed heartbeat persistence tests
 * File-backed stale-member removal persistence tests
@@ -1408,7 +1499,7 @@ Completed core areas:
 
 Still planned:
 
-* Background stale-member cleanup loop
+* Automatic rebalance after background stale cleanup
 * Stronger crash recovery beyond missing-index rebuild
 * CLI client
 * Docker Compose demo
