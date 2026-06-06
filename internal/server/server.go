@@ -25,6 +25,7 @@ const defaultStaleMemberTimeout = 5 * time.Minute
 type assignmentStore interface {
 	Save(group string, topic string, assignments []group.Assignment) error
 	Get(group string, topic string) ([]group.Assignment, bool, error)
+	Topics(group string) ([]string, error)
 	Delete(group string, topic string) error
 }
 
@@ -198,7 +199,7 @@ func New() (*http.Server, error) {
 	return srv, err
 }
 
-func newConfiguredServer() (*http.Server, groupRegistry, error) {
+func newConfiguredServer() (*http.Server, *Server, error) {
 	offsetStore, err := consumer.NewOffsetStore(defaultOffsetStorePath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create offset store: %w", err)
@@ -220,7 +221,18 @@ func newConfiguredServer() (*http.Server, groupRegistry, error) {
 		return nil, nil, fmt.Errorf("load registry store: %w", err)
 	}
 
-	return newServer(topic.NewManager(), offsetStore, assignmentFileStore, registryStore), registryStore, nil
+	server := &Server{
+		topicManager:    topic.NewManager(),
+		offsetStore:     offsetStore,
+		assigner:        group.NewAssigner(),
+		registry:        registryStore,
+		assignmentStore: assignmentFileStore,
+	}
+
+	return &http.Server{
+		Addr:    defaultAddr,
+		Handler: server.routes(),
+	}, server, nil
 }
 
 func newServer(topicManager *topic.Manager, offsetStore *consumer.OffsetStore, assignmentStore assignmentStore, registry groupRegistry) *http.Server {
@@ -261,7 +273,7 @@ func (s *Server) routes() http.Handler {
 }
 
 func Start() error {
-	srv, registry, err := newConfiguredServer()
+	srv, server, err := newConfiguredServer()
 	if err != nil {
 		return err
 	}
@@ -269,7 +281,15 @@ func Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	srv.RegisterOnShutdown(cancel)
-	startStaleMemberCleanup(ctx, registry, defaultStaleCleanupInterval, defaultStaleMemberTimeout)
+	startStaleMemberCleanup(
+		ctx,
+		server.registry,
+		server.assignmentStore,
+		server.topicManager,
+		server.assigner,
+		defaultStaleCleanupInterval,
+		defaultStaleMemberTimeout,
+	)
 
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("start broker HTTP server: %w", err)
@@ -303,8 +323,85 @@ func cleanupStaleMembersOnce(registry groupRegistry, now time.Time, timeout time
 	return nil
 }
 
-func startStaleMemberCleanup(ctx context.Context, registry groupRegistry, interval time.Duration, timeout time.Duration) {
-	if ctx == nil || registry == nil || interval <= 0 || timeout <= 0 {
+func cleanupStaleMembersAndRebalanceOnce(registry groupRegistry, assignmentStore assignmentStore, topicManager *topic.Manager, assigner *group.Assigner, now time.Time, timeout time.Duration) error {
+	if registry == nil {
+		return fmt.Errorf("group registry cannot be nil")
+	}
+	if assignmentStore == nil {
+		return fmt.Errorf("assignment store cannot be nil")
+	}
+	if topicManager == nil {
+		return fmt.Errorf("topic manager cannot be nil")
+	}
+	if assigner == nil {
+		return fmt.Errorf("assigner cannot be nil")
+	}
+	if now.IsZero() {
+		return fmt.Errorf("now time cannot be zero")
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("timeout must be positive")
+	}
+
+	groups, err := registry.Groups()
+	if err != nil {
+		return fmt.Errorf("list groups: %w", err)
+	}
+
+	for _, groupName := range groups {
+		removedMembers, err := registry.RemoveStaleMembers(groupName, now, timeout)
+		if err != nil {
+			return fmt.Errorf("remove stale members for group %q: %w", groupName, err)
+		}
+		if len(removedMembers) == 0 {
+			continue
+		}
+
+		topicNames, err := assignmentStore.Topics(groupName)
+		if err != nil {
+			return fmt.Errorf("list assignment topics for group %q: %w", groupName, err)
+		}
+		if len(topicNames) == 0 {
+			continue
+		}
+
+		activeMembers, err := registry.Members(groupName)
+		if err != nil {
+			return fmt.Errorf("list active members for group %q: %w", groupName, err)
+		}
+
+		if len(activeMembers) == 0 {
+			for _, topicName := range topicNames {
+				if err := assignmentStore.Delete(groupName, topicName); err != nil {
+					return fmt.Errorf("delete assignments for group %q topic %q: %w", groupName, topicName, err)
+				}
+			}
+			continue
+		}
+
+		assignerMembers := convertRegistryMembers(activeMembers)
+		for _, topicName := range topicNames {
+			topicInfo, exists := topicManager.GetTopic(topicName)
+			if !exists {
+				continue
+			}
+
+			assignments, err := assigner.Assign(topicName, len(topicInfo.Partitions), assignerMembers)
+			if err != nil {
+				return fmt.Errorf("assign partitions for group %q topic %q: %w", groupName, topicName, err)
+			}
+
+			if err := assignmentStore.Save(groupName, topicName, assignments); err != nil {
+				return fmt.Errorf("save assignments for group %q topic %q: %w", groupName, topicName, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func startStaleMemberCleanup(ctx context.Context, registry groupRegistry, assignmentStore assignmentStore, topicManager *topic.Manager, assigner *group.Assigner, interval time.Duration, timeout time.Duration) {
+	if ctx == nil || registry == nil || assignmentStore == nil || topicManager == nil || assigner == nil || interval <= 0 || timeout <= 0 {
 		return
 	}
 
@@ -317,7 +414,7 @@ func startStaleMemberCleanup(ctx context.Context, registry groupRegistry, interv
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
-				_ = cleanupStaleMembersOnce(registry, now, timeout)
+				_ = cleanupStaleMembersAndRebalanceOnce(registry, assignmentStore, topicManager, assigner, now, timeout)
 			}
 		}
 	}()
@@ -1122,6 +1219,15 @@ func convertGroupMembers(members []group.GroupMember) []groupMemberResponse {
 	}
 
 	return responseMembers
+}
+
+func convertRegistryMembers(members []group.GroupMember) []group.Member {
+	convertedMembers := make([]group.Member, 0, len(members))
+	for _, member := range members {
+		convertedMembers = append(convertedMembers, group.Member{ID: member.ID})
+	}
+
+	return convertedMembers
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, response interface{}) {

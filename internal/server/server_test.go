@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1671,159 +1672,550 @@ func TestGroupCleanupAndRebalanceAfterRestartUsesPersistedMembersAndLastSeen(t *
 	}
 }
 
-func TestCleanupStaleMembersOnceRemovesStaleMembersAcrossAllGroups(t *testing.T) {
+func TestCleanupStaleMembersAndRebalanceOnceRemovesStaleMembersAndRebalancesAssignments(t *testing.T) {
+	chdirTemp(t)
 	registry := group.NewRegistry()
+	assignmentStore := group.NewAssignmentStore()
+	topicManager := topic.NewManager()
 	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
 
+	if err := topicManager.CreateTopic("orders", 4); err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
 	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", now.Add(-10*time.Minute))
-	recordRegistryHeartbeat(t, registry, "billing-workers", "member-b", now.Add(-10*time.Minute))
-	recordRegistryHeartbeat(t, registry, "billing-workers", "member-c", now.Add(-time.Minute))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", now.Add(-time.Minute))
+	saveAssignments(t, assignmentStore, "analytics-workers", "orders", []group.Assignment{
+		{
+			MemberID: "member-a",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{0, 1}},
+			},
+		},
+		{
+			MemberID: "member-b",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{2, 3}},
+			},
+		},
+	})
 
-	if err := cleanupStaleMembersOnce(registry, now, 5*time.Minute); err != nil {
-		t.Fatalf("failed to clean stale members: %v", err)
+	if err := cleanupStaleMembersAndRebalanceOnce(registry, assignmentStore, topicManager, group.NewAssigner(), now, 5*time.Minute); err != nil {
+		t.Fatalf("failed to clean stale members and rebalance: %v", err)
 	}
 
-	analyticsMembers, err := registry.Members("analytics-workers")
+	members, err := registry.Members("analytics-workers")
 	if err != nil {
-		t.Fatalf("failed to get analytics members: %v", err)
+		t.Fatalf("failed to get group members: %v", err)
 	}
-	if len(analyticsMembers) != 0 {
-		t.Fatalf("expected no analytics members, got %v", analyticsMembers)
+	expectedMembers := []group.GroupMember{
+		{ID: "member-b", LastSeen: now.Add(-time.Minute)},
+	}
+	if !reflect.DeepEqual(members, expectedMembers) {
+		t.Fatalf("expected %v, got %v", expectedMembers, members)
 	}
 
-	billingMembers, err := registry.Members("billing-workers")
+	assignments, found, err := assignmentStore.Get("analytics-workers", "orders")
 	if err != nil {
-		t.Fatalf("failed to get billing members: %v", err)
+		t.Fatalf("failed to get assignments: %v", err)
 	}
-	expectedBillingMembers := []group.GroupMember{
-		{ID: "member-c", LastSeen: now.Add(-time.Minute)},
+	if !found {
+		t.Fatal("expected assignments to be found")
 	}
-	if !reflect.DeepEqual(billingMembers, expectedBillingMembers) {
-		t.Fatalf("expected %v, got %v", expectedBillingMembers, billingMembers)
+	expectedAssignments := []group.Assignment{
+		{
+			MemberID: "member-b",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{0, 1, 2, 3}},
+			},
+		},
+	}
+	if !reflect.DeepEqual(assignments, expectedAssignments) {
+		t.Fatalf("expected %v, got %v", expectedAssignments, assignments)
 	}
 }
 
-func TestCleanupStaleMembersOnceKeepsActiveMembers(t *testing.T) {
-	registry := group.NewRegistry()
+func TestCleanupStaleMembersAndRebalanceOnceDoesNotRebalanceWhenNoStaleMembersAreRemoved(t *testing.T) {
+	expectedErr := errors.New("should not be called")
+	registry := &fakeCleanupRegistry{
+		groups: []string{"analytics-workers"},
+	}
+	assignmentStore := &fakeCleanupAssignmentStore{
+		topicsErr: expectedErr,
+		saveErr:   expectedErr,
+	}
 	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
 
-	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", now.Add(-time.Minute))
+	if err := cleanupStaleMembersAndRebalanceOnce(registry, assignmentStore, topic.NewManager(), group.NewAssigner(), now, 5*time.Minute); err != nil {
+		t.Fatalf("expected cleanup to succeed, got %v", err)
+	}
 
-	if err := cleanupStaleMembersOnce(registry, now, 5*time.Minute); err != nil {
-		t.Fatalf("failed to clean stale members: %v", err)
+	if got := assignmentStore.topicsCallCount(); got != 0 {
+		t.Fatalf("expected no topic calls, got %d", got)
+	}
+	if got := assignmentStore.saveCallCount(); got != 0 {
+		t.Fatalf("expected no save calls, got %d", got)
+	}
+}
+
+func TestCleanupStaleMembersAndRebalanceOnceHandlesGroupWithNoSavedAssignmentTopics(t *testing.T) {
+	registry := group.NewRegistry()
+	assignmentStore := group.NewAssignmentStore()
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", now.Add(-10*time.Minute))
+
+	if err := cleanupStaleMembersAndRebalanceOnce(registry, assignmentStore, topic.NewManager(), group.NewAssigner(), now, 5*time.Minute); err != nil {
+		t.Fatalf("failed to clean stale members and rebalance: %v", err)
+	}
+
+	members, err := registry.Members("analytics-workers")
+	if err != nil {
+		t.Fatalf("failed to get group members: %v", err)
+	}
+	if len(members) != 0 {
+		t.Fatalf("expected no members, got %v", members)
+	}
+}
+
+func TestCleanupStaleMembersAndRebalanceOnceRebalancesMultipleSavedTopicsForGroup(t *testing.T) {
+	chdirTemp(t)
+	registry := group.NewRegistry()
+	assignmentStore := group.NewAssignmentStore()
+	topicManager := topic.NewManager()
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+
+	if err := topicManager.CreateTopic("orders", 4); err != nil {
+		t.Fatalf("failed to create orders topic: %v", err)
+	}
+	if err := topicManager.CreateTopic("payments", 2); err != nil {
+		t.Fatalf("failed to create payments topic: %v", err)
+	}
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", now.Add(-10*time.Minute))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", now.Add(-time.Minute))
+	saveAssignments(t, assignmentStore, "analytics-workers", "orders", []group.Assignment{
+		{
+			MemberID: "member-a",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{0, 1}},
+			},
+		},
+		{
+			MemberID: "member-b",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{2, 3}},
+			},
+		},
+	})
+	saveAssignments(t, assignmentStore, "analytics-workers", "payments", []group.Assignment{
+		{
+			MemberID: "member-a",
+			Topics: []group.TopicAssignment{
+				{Topic: "payments", Partitions: []int{0}},
+			},
+		},
+		{
+			MemberID: "member-b",
+			Topics: []group.TopicAssignment{
+				{Topic: "payments", Partitions: []int{1}},
+			},
+		},
+	})
+
+	if err := cleanupStaleMembersAndRebalanceOnce(registry, assignmentStore, topicManager, group.NewAssigner(), now, 5*time.Minute); err != nil {
+		t.Fatalf("failed to clean stale members and rebalance: %v", err)
+	}
+
+	ordersAssignments, found, err := assignmentStore.Get("analytics-workers", "orders")
+	if err != nil {
+		t.Fatalf("failed to get orders assignments: %v", err)
+	}
+	if !found {
+		t.Fatal("expected orders assignments to be found")
+	}
+	expectedOrdersAssignments := []group.Assignment{
+		{
+			MemberID: "member-b",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{0, 1, 2, 3}},
+			},
+		},
+	}
+	if !reflect.DeepEqual(ordersAssignments, expectedOrdersAssignments) {
+		t.Fatalf("expected %v, got %v", expectedOrdersAssignments, ordersAssignments)
+	}
+
+	paymentsAssignments, found, err := assignmentStore.Get("analytics-workers", "payments")
+	if err != nil {
+		t.Fatalf("failed to get payments assignments: %v", err)
+	}
+	if !found {
+		t.Fatal("expected payments assignments to be found")
+	}
+	expectedPaymentsAssignments := []group.Assignment{
+		{
+			MemberID: "member-b",
+			Topics: []group.TopicAssignment{
+				{Topic: "payments", Partitions: []int{0, 1}},
+			},
+		},
+	}
+	if !reflect.DeepEqual(paymentsAssignments, expectedPaymentsAssignments) {
+		t.Fatalf("expected %v, got %v", expectedPaymentsAssignments, paymentsAssignments)
+	}
+}
+
+func TestCleanupStaleMembersAndRebalanceOnceHandlesMultipleGroups(t *testing.T) {
+	chdirTemp(t)
+	registry := group.NewRegistry()
+	assignmentStore := group.NewAssignmentStore()
+	topicManager := topic.NewManager()
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+
+	if err := topicManager.CreateTopic("orders", 2); err != nil {
+		t.Fatalf("failed to create orders topic: %v", err)
+	}
+	if err := topicManager.CreateTopic("payments", 2); err != nil {
+		t.Fatalf("failed to create payments topic: %v", err)
+	}
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", now.Add(-10*time.Minute))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", now.Add(-time.Minute))
+	recordRegistryHeartbeat(t, registry, "billing-workers", "member-c", now.Add(-10*time.Minute))
+	recordRegistryHeartbeat(t, registry, "billing-workers", "member-d", now.Add(-time.Minute))
+	saveAssignments(t, assignmentStore, "analytics-workers", "orders", []group.Assignment{
+		{
+			MemberID: "member-a",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{0}},
+			},
+		},
+		{
+			MemberID: "member-b",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{1}},
+			},
+		},
+	})
+	saveAssignments(t, assignmentStore, "billing-workers", "payments", []group.Assignment{
+		{
+			MemberID: "member-c",
+			Topics: []group.TopicAssignment{
+				{Topic: "payments", Partitions: []int{0}},
+			},
+		},
+		{
+			MemberID: "member-d",
+			Topics: []group.TopicAssignment{
+				{Topic: "payments", Partitions: []int{1}},
+			},
+		},
+	})
+
+	if err := cleanupStaleMembersAndRebalanceOnce(registry, assignmentStore, topicManager, group.NewAssigner(), now, 5*time.Minute); err != nil {
+		t.Fatalf("failed to clean stale members and rebalance: %v", err)
+	}
+
+	analyticsAssignments, found, err := assignmentStore.Get("analytics-workers", "orders")
+	if err != nil {
+		t.Fatalf("failed to get analytics assignments: %v", err)
+	}
+	if !found {
+		t.Fatal("expected analytics assignments to be found")
+	}
+	expectedAnalyticsAssignments := []group.Assignment{
+		{
+			MemberID: "member-b",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{0, 1}},
+			},
+		},
+	}
+	if !reflect.DeepEqual(analyticsAssignments, expectedAnalyticsAssignments) {
+		t.Fatalf("expected %v, got %v", expectedAnalyticsAssignments, analyticsAssignments)
+	}
+
+	billingAssignments, found, err := assignmentStore.Get("billing-workers", "payments")
+	if err != nil {
+		t.Fatalf("failed to get billing assignments: %v", err)
+	}
+	if !found {
+		t.Fatal("expected billing assignments to be found")
+	}
+	expectedBillingAssignments := []group.Assignment{
+		{
+			MemberID: "member-d",
+			Topics: []group.TopicAssignment{
+				{Topic: "payments", Partitions: []int{0, 1}},
+			},
+		},
+	}
+	if !reflect.DeepEqual(billingAssignments, expectedBillingAssignments) {
+		t.Fatalf("expected %v, got %v", expectedBillingAssignments, billingAssignments)
+	}
+}
+
+func TestCleanupStaleMembersAndRebalanceOnceDeletesAssignmentsWhenAllMembersAreRemoved(t *testing.T) {
+	chdirTemp(t)
+	registry := group.NewRegistry()
+	assignmentStore := group.NewAssignmentStore()
+	topicManager := topic.NewManager()
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+
+	if err := topicManager.CreateTopic("orders", 2); err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", now.Add(-10*time.Minute))
+	saveAssignments(t, assignmentStore, "analytics-workers", "orders", []group.Assignment{
+		{
+			MemberID: "member-a",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{0, 1}},
+			},
+		},
+	})
+
+	if err := cleanupStaleMembersAndRebalanceOnce(registry, assignmentStore, topicManager, group.NewAssigner(), now, 5*time.Minute); err != nil {
+		t.Fatalf("failed to clean stale members and rebalance: %v", err)
 	}
 
 	members, err := registry.Members("analytics-workers")
 	if err != nil {
 		t.Fatalf("failed to get members: %v", err)
 	}
-	expected := []group.GroupMember{
-		{ID: "member-a", LastSeen: now.Add(-time.Minute)},
+	if len(members) != 0 {
+		t.Fatalf("expected no members, got %v", members)
 	}
-	if !reflect.DeepEqual(members, expected) {
-		t.Fatalf("expected %v, got %v", expected, members)
+
+	assignments, found, err := assignmentStore.Get("analytics-workers", "orders")
+	if err != nil {
+		t.Fatalf("failed to get assignments: %v", err)
+	}
+	if found {
+		t.Fatalf("expected assignments to be deleted, got %v", assignments)
 	}
 }
 
-func TestCleanupStaleMembersOnceRemovesGroupWhenAllMembersAreStale(t *testing.T) {
+func TestCleanupStaleMembersAndRebalanceOnceSkipsMissingSavedAssignmentTopic(t *testing.T) {
 	registry := group.NewRegistry()
+	assignmentStore := group.NewAssignmentStore()
 	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
 
 	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", now.Add(-10*time.Minute))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", now.Add(-time.Minute))
+	saveAssignments(t, assignmentStore, "analytics-workers", "missing-topic", []group.Assignment{
+		{
+			MemberID: "member-a",
+			Topics: []group.TopicAssignment{
+				{Topic: "missing-topic", Partitions: []int{0}},
+			},
+		},
+	})
 
-	if err := cleanupStaleMembersOnce(registry, now, 5*time.Minute); err != nil {
-		t.Fatalf("failed to clean stale members: %v", err)
+	if err := cleanupStaleMembersAndRebalanceOnce(registry, assignmentStore, topic.NewManager(), group.NewAssigner(), now, 5*time.Minute); err != nil {
+		t.Fatalf("failed to clean stale members and rebalance: %v", err)
 	}
 
-	groups, err := registry.Groups()
+	assignments, found, err := assignmentStore.Get("analytics-workers", "missing-topic")
 	if err != nil {
-		t.Fatalf("failed to get groups: %v", err)
+		t.Fatalf("failed to get assignments: %v", err)
 	}
-	if len(groups) != 0 {
-		t.Fatalf("expected no groups, got %v", groups)
+	if !found {
+		t.Fatal("expected missing topic assignment state to be preserved")
+	}
+	expectedAssignments := []group.Assignment{
+		{
+			MemberID: "member-a",
+			Topics: []group.TopicAssignment{
+				{Topic: "missing-topic", Partitions: []int{0}},
+			},
+		},
+	}
+	if !reflect.DeepEqual(assignments, expectedAssignments) {
+		t.Fatalf("expected %v, got %v", expectedAssignments, assignments)
 	}
 }
 
-func TestCleanupStaleMembersOnceHandlesEmptyGroupList(t *testing.T) {
+func TestCleanupStaleMembersAndRebalanceOnceRejectsInvalidInput(t *testing.T) {
 	registry := group.NewRegistry()
-	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
-
-	if err := cleanupStaleMembersOnce(registry, now, 5*time.Minute); err != nil {
-		t.Fatalf("expected empty group cleanup to succeed, got %v", err)
-	}
-}
-
-func TestCleanupStaleMembersOnceRejectsInvalidInput(t *testing.T) {
-	registry := group.NewRegistry()
+	store := group.NewAssignmentStore()
+	topicManager := topic.NewManager()
+	assigner := group.NewAssigner()
 	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
 
 	tests := []struct {
-		name     string
-		registry groupRegistry
-		now      time.Time
-		timeout  time.Duration
+		name            string
+		registry        groupRegistry
+		assignmentStore assignmentStore
+		topicManager    *topic.Manager
+		assigner        *group.Assigner
+		now             time.Time
+		timeout         time.Duration
 	}{
-		{name: "nil registry", registry: nil, now: now, timeout: 5 * time.Minute},
-		{name: "zero now", registry: registry, now: time.Time{}, timeout: 5 * time.Minute},
-		{name: "zero timeout", registry: registry, now: now, timeout: 0},
-		{name: "negative timeout", registry: registry, now: now, timeout: -time.Minute},
+		{name: "nil registry", registry: nil, assignmentStore: store, topicManager: topicManager, assigner: assigner, now: now, timeout: 5 * time.Minute},
+		{name: "nil assignment store", registry: registry, assignmentStore: nil, topicManager: topicManager, assigner: assigner, now: now, timeout: 5 * time.Minute},
+		{name: "nil topic manager", registry: registry, assignmentStore: store, topicManager: nil, assigner: assigner, now: now, timeout: 5 * time.Minute},
+		{name: "nil assigner", registry: registry, assignmentStore: store, topicManager: topicManager, assigner: nil, now: now, timeout: 5 * time.Minute},
+		{name: "zero now", registry: registry, assignmentStore: store, topicManager: topicManager, assigner: assigner, now: time.Time{}, timeout: 5 * time.Minute},
+		{name: "zero timeout", registry: registry, assignmentStore: store, topicManager: topicManager, assigner: assigner, now: now, timeout: 0},
+		{name: "negative timeout", registry: registry, assignmentStore: store, topicManager: topicManager, assigner: assigner, now: now, timeout: -time.Minute},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := cleanupStaleMembersOnce(tt.registry, tt.now, tt.timeout); err == nil {
+			if err := cleanupStaleMembersAndRebalanceOnce(tt.registry, tt.assignmentStore, tt.topicManager, tt.assigner, tt.now, tt.timeout); err == nil {
 				t.Fatal("expected error")
 			}
 		})
 	}
 }
 
-func TestCleanupStaleMembersOnceReturnsErrorWhenGroupsFails(t *testing.T) {
-	expectedErr := errors.New("groups failed")
-	registry := &fakeCleanupRegistry{groupsErr: expectedErr}
+func TestCleanupStaleMembersAndRebalanceOnceReturnsDependencyErrors(t *testing.T) {
+	chdirTemp(t)
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
 
-	err := cleanupStaleMembersOnce(registry, time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC), 5*time.Minute)
-	if err == nil {
-		t.Fatal("expected error")
+	tests := []struct {
+		name            string
+		registry        groupRegistry
+		assignmentStore assignmentStore
+		topicManager    *topic.Manager
+		expectedErr     error
+	}{
+		{
+			name:            "groups fails",
+			registry:        &fakeCleanupRegistry{groupsErr: errors.New("groups failed")},
+			assignmentStore: group.NewAssignmentStore(),
+			topicManager:    topic.NewManager(),
+			expectedErr:     errors.New("groups failed"),
+		},
+		{
+			name: "remove stale members fails",
+			registry: &fakeCleanupRegistry{
+				groups:    []string{"analytics-workers"},
+				removeErr: errors.New("remove failed"),
+			},
+			assignmentStore: group.NewAssignmentStore(),
+			topicManager:    topic.NewManager(),
+			expectedErr:     errors.New("remove failed"),
+		},
+		{
+			name: "assignment topics fails",
+			registry: &fakeCleanupRegistry{
+				groups: []string{"analytics-workers"},
+				removedMembers: map[string][]group.GroupMember{
+					"analytics-workers": {{ID: "member-a", LastSeen: now.Add(-10 * time.Minute)}},
+				},
+			},
+			assignmentStore: &fakeCleanupAssignmentStore{topicsErr: errors.New("topics failed")},
+			topicManager:    topic.NewManager(),
+			expectedErr:     errors.New("topics failed"),
+		},
+		{
+			name: "members fails after stale removal",
+			registry: &fakeCleanupRegistry{
+				groups: []string{"analytics-workers"},
+				removedMembers: map[string][]group.GroupMember{
+					"analytics-workers": {{ID: "member-a", LastSeen: now.Add(-10 * time.Minute)}},
+				},
+				membersErr: errors.New("members failed"),
+			},
+			assignmentStore: &fakeCleanupAssignmentStore{
+				topics: map[string][]string{"analytics-workers": []string{"orders"}},
+			},
+			topicManager: topic.NewManager(),
+			expectedErr:  errors.New("members failed"),
+		},
+		{
+			name: "save fails",
+			registry: &fakeCleanupRegistry{
+				groups: []string{"analytics-workers"},
+				removedMembers: map[string][]group.GroupMember{
+					"analytics-workers": {{ID: "member-a", LastSeen: now.Add(-10 * time.Minute)}},
+				},
+				members: map[string][]group.GroupMember{
+					"analytics-workers": {{ID: "member-b", LastSeen: now.Add(-time.Minute)}},
+				},
+			},
+			assignmentStore: &fakeCleanupAssignmentStore{
+				topics:  map[string][]string{"analytics-workers": []string{"orders"}},
+				saveErr: errors.New("save failed"),
+			},
+			topicManager: topicManagerWithTopic(t, "orders", 2),
+			expectedErr:  errors.New("save failed"),
+		},
+		{
+			name: "delete fails when no active members remain",
+			registry: &fakeCleanupRegistry{
+				groups: []string{"analytics-workers"},
+				removedMembers: map[string][]group.GroupMember{
+					"analytics-workers": {{ID: "member-a", LastSeen: now.Add(-10 * time.Minute)}},
+				},
+			},
+			assignmentStore: &fakeCleanupAssignmentStore{
+				topics:    map[string][]string{"analytics-workers": []string{"orders"}},
+				deleteErr: errors.New("delete failed"),
+			},
+			topicManager: topic.NewManager(),
+			expectedErr:  errors.New("delete failed"),
+		},
 	}
-	if !errors.Is(err, expectedErr) {
-		t.Fatalf("expected error %v, got %v", expectedErr, err)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := cleanupStaleMembersAndRebalanceOnce(tt.registry, tt.assignmentStore, tt.topicManager, group.NewAssigner(), now, 5*time.Minute)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if err.Error() == "" || tt.expectedErr.Error() == "" || !errors.Is(err, tt.expectedErr) && !strings.Contains(err.Error(), tt.expectedErr.Error()) {
+				t.Fatalf("expected error %v, got %v", tt.expectedErr, err)
+			}
+		})
 	}
 }
 
-func TestCleanupStaleMembersOnceReturnsErrorWhenRemoveStaleMembersFails(t *testing.T) {
-	expectedErr := errors.New("remove failed")
-	registry := &fakeCleanupRegistry{
-		groups:    []string{"analytics-workers"},
-		removeErr: expectedErr,
-	}
-
-	err := cleanupStaleMembersOnce(registry, time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC), 5*time.Minute)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !errors.Is(err, expectedErr) {
-		t.Fatalf("expected error %v, got %v", expectedErr, err)
-	}
-}
-
-func TestBackgroundStaleMemberCleanupRemovesStaleMembersAfterTick(t *testing.T) {
+func TestBackgroundStaleMemberCleanupRemovesStaleMembersAndUpdatesAssignmentsAfterTick(t *testing.T) {
+	chdirTemp(t)
 	registry := group.NewRegistry()
+	assignmentStore := group.NewAssignmentStore()
+	topicManager := topic.NewManager()
 
+	if err := topicManager.CreateTopic("orders", 4); err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
 	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-10*time.Minute))
 	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", time.Now().Add(-time.Second))
+	saveAssignments(t, assignmentStore, "analytics-workers", "orders", []group.Assignment{
+		{
+			MemberID: "member-a",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{0, 1}},
+			},
+		},
+		{
+			MemberID: "member-b",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{2, 3}},
+			},
+		},
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	startStaleMemberCleanup(ctx, registry, 5*time.Millisecond, 5*time.Minute)
+	startStaleMemberCleanup(ctx, registry, assignmentStore, topicManager, group.NewAssigner(), 5*time.Millisecond, 5*time.Minute)
 
+	expectedAssignments := []group.Assignment{
+		{
+			MemberID: "member-b",
+			Topics: []group.TopicAssignment{
+				{Topic: "orders", Partitions: []int{0, 1, 2, 3}},
+			},
+		},
+	}
 	waitForCondition(t, time.Second, func() bool {
-		members, err := registry.Members("analytics-workers")
-		if err != nil {
+		assignments, found, err := assignmentStore.Get("analytics-workers", "orders")
+		if err != nil || !found {
 			return false
 		}
 
-		return len(members) == 1 && members[0].ID == "member-b"
+		return reflect.DeepEqual(assignments, expectedAssignments)
 	})
 
 	members, err := registry.Members("analytics-workers")
@@ -1837,9 +2229,10 @@ func TestBackgroundStaleMemberCleanupRemovesStaleMembersAfterTick(t *testing.T) 
 
 func TestBackgroundStaleMemberCleanupStopsWhenContextIsCancelled(t *testing.T) {
 	registry := &fakeCleanupRegistry{groups: []string{"analytics-workers"}}
+	assignmentStore := &fakeCleanupAssignmentStore{}
 	ctx, cancel := context.WithCancel(context.Background())
 
-	startStaleMemberCleanup(ctx, registry, 5*time.Millisecond, 5*time.Minute)
+	startStaleMemberCleanup(ctx, registry, assignmentStore, topic.NewManager(), group.NewAssigner(), 5*time.Millisecond, 5*time.Minute)
 	waitForCondition(t, time.Second, func() bool {
 		return registry.removeCallCount() > 0
 	})
@@ -1852,6 +2245,21 @@ func TestBackgroundStaleMemberCleanupStopsWhenContextIsCancelled(t *testing.T) {
 	if got := registry.removeCallCount(); got != callsAfterCancel {
 		t.Fatalf("expected cleanup to stop at %d calls, got %d", callsAfterCancel, got)
 	}
+}
+
+func TestBackgroundStaleMemberCleanupKeepsRunningAfterCleanupError(t *testing.T) {
+	registry := &fakeCleanupRegistry{
+		groups:    []string{"analytics-workers"},
+		groupsErr: errors.New("first cleanup failed"),
+	}
+	assignmentStore := &fakeCleanupAssignmentStore{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	startStaleMemberCleanup(ctx, registry, assignmentStore, topic.NewManager(), group.NewAssigner(), 5*time.Millisecond, 5*time.Minute)
+	waitForCondition(t, time.Second, func() bool {
+		return registry.removeCallCount() > 0
+	})
 }
 
 func TestGroupJoin(t *testing.T) {
@@ -2893,12 +3301,35 @@ func loadDefaultRegistryFileStore(t *testing.T) *group.RegistryFileStore {
 	return registryStore
 }
 
+func saveAssignments(t *testing.T, store assignmentStore, groupName string, topicName string, assignments []group.Assignment) {
+	t.Helper()
+
+	if err := store.Save(groupName, topicName, assignments); err != nil {
+		t.Fatalf("failed to save assignments: %v", err)
+	}
+}
+
+func topicManagerWithTopic(t *testing.T, topicName string, partitionCount int) *topic.Manager {
+	t.Helper()
+	chdirTemp(t)
+
+	topicManager := topic.NewManager()
+	if err := topicManager.CreateTopic(topicName, partitionCount); err != nil {
+		t.Fatalf("failed to create topic: %v", err)
+	}
+
+	return topicManager
+}
+
 type fakeCleanupRegistry struct {
-	mu          sync.Mutex
-	groups      []string
-	groupsErr   error
-	removeErr   error
-	removeCalls int
+	mu             sync.Mutex
+	groups         []string
+	groupsErr      error
+	removeErr      error
+	membersErr     error
+	removedMembers map[string][]group.GroupMember
+	members        map[string][]group.GroupMember
+	removeCalls    int
 }
 
 func (r *fakeCleanupRegistry) Groups() ([]string, error) {
@@ -2906,7 +3337,9 @@ func (r *fakeCleanupRegistry) Groups() ([]string, error) {
 	defer r.mu.Unlock()
 
 	if r.groupsErr != nil {
-		return nil, r.groupsErr
+		err := r.groupsErr
+		r.groupsErr = nil
+		return nil, err
 	}
 
 	return append([]string(nil), r.groups...), nil
@@ -2924,15 +3357,22 @@ func (r *fakeCleanupRegistry) Leave(_ string, _ string) error {
 	return nil
 }
 
-func (r *fakeCleanupRegistry) Members(_ string) ([]group.GroupMember, error) {
-	return nil, nil
+func (r *fakeCleanupRegistry) Members(groupName string) ([]group.GroupMember, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.membersErr != nil {
+		return nil, r.membersErr
+	}
+
+	return cloneTestGroupMembers(r.members[groupName]), nil
 }
 
 func (r *fakeCleanupRegistry) StaleMembers(_ string, _ time.Time, _ time.Duration) ([]group.GroupMember, error) {
 	return nil, nil
 }
 
-func (r *fakeCleanupRegistry) RemoveStaleMembers(_ string, _ time.Time, _ time.Duration) ([]group.GroupMember, error) {
+func (r *fakeCleanupRegistry) RemoveStaleMembers(groupName string, _ time.Time, _ time.Duration) ([]group.GroupMember, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -2941,7 +3381,7 @@ func (r *fakeCleanupRegistry) RemoveStaleMembers(_ string, _ time.Time, _ time.D
 		return nil, r.removeErr
 	}
 
-	return nil, nil
+	return cloneTestGroupMembers(r.removedMembers[groupName]), nil
 }
 
 func (r *fakeCleanupRegistry) removeCallCount() int {
@@ -2949,6 +3389,141 @@ func (r *fakeCleanupRegistry) removeCallCount() int {
 	defer r.mu.Unlock()
 
 	return r.removeCalls
+}
+
+type fakeCleanupAssignmentStore struct {
+	mu          sync.Mutex
+	assignments map[string]map[string][]group.Assignment
+	topics      map[string][]string
+	topicsErr   error
+	saveErr     error
+	deleteErr   error
+	topicsCalls int
+	saveCalls   int
+	deleteCalls int
+}
+
+func (s *fakeCleanupAssignmentStore) Save(groupName string, topicName string, assignments []group.Assignment) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.saveCalls++
+	if s.saveErr != nil {
+		return s.saveErr
+	}
+
+	if s.assignments == nil {
+		s.assignments = make(map[string]map[string][]group.Assignment)
+	}
+	if _, exists := s.assignments[groupName]; !exists {
+		s.assignments[groupName] = make(map[string][]group.Assignment)
+	}
+
+	s.assignments[groupName][topicName] = cloneTestAssignments(assignments)
+	return nil
+}
+
+func (s *fakeCleanupAssignmentStore) Get(groupName string, topicName string) ([]group.Assignment, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	groupAssignments, exists := s.assignments[groupName]
+	if !exists {
+		return nil, false, nil
+	}
+
+	assignments, exists := groupAssignments[topicName]
+	if !exists {
+		return nil, false, nil
+	}
+
+	return cloneTestAssignments(assignments), true, nil
+}
+
+func (s *fakeCleanupAssignmentStore) Topics(groupName string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.topicsCalls++
+	if s.topicsErr != nil {
+		return nil, s.topicsErr
+	}
+
+	if s.topics != nil {
+		return append([]string(nil), s.topics[groupName]...), nil
+	}
+
+	groupAssignments := s.assignments[groupName]
+	topics := make([]string, 0, len(groupAssignments))
+	for topicName := range groupAssignments {
+		topics = append(topics, topicName)
+	}
+
+	return topics, nil
+}
+
+func (s *fakeCleanupAssignmentStore) Delete(groupName string, topicName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.deleteCalls++
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+
+	groupAssignments, exists := s.assignments[groupName]
+	if !exists {
+		return nil
+	}
+
+	delete(groupAssignments, topicName)
+	if len(groupAssignments) == 0 {
+		delete(s.assignments, groupName)
+	}
+
+	return nil
+}
+
+func (s *fakeCleanupAssignmentStore) topicsCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.topicsCalls
+}
+
+func (s *fakeCleanupAssignmentStore) saveCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.saveCalls
+}
+
+func cloneTestAssignments(assignments []group.Assignment) []group.Assignment {
+	copiedAssignments := make([]group.Assignment, len(assignments))
+	for i, assignment := range assignments {
+		copiedAssignments[i] = group.Assignment{
+			MemberID: assignment.MemberID,
+			Topics:   cloneTestTopicAssignments(assignment.Topics),
+		}
+	}
+
+	return copiedAssignments
+}
+
+func cloneTestTopicAssignments(topicAssignments []group.TopicAssignment) []group.TopicAssignment {
+	copiedTopicAssignments := make([]group.TopicAssignment, len(topicAssignments))
+	for i, topicAssignment := range topicAssignments {
+		copiedTopicAssignments[i] = group.TopicAssignment{
+			Topic:      topicAssignment.Topic,
+			Partitions: append([]int(nil), topicAssignment.Partitions...),
+		}
+	}
+
+	return copiedTopicAssignments
+}
+
+func cloneTestGroupMembers(members []group.GroupMember) []group.GroupMember {
+	return append([]group.GroupMember(nil), members...)
 }
 
 func recordRegistryHeartbeat(t *testing.T, registry *group.Registry, groupName string, memberID string, lastSeen time.Time) {
