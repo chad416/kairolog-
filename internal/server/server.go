@@ -114,6 +114,13 @@ type groupCleanupAndRebalanceResponse struct {
 	Assignments    []groupAssignmentResponse `json:"assignments"`
 }
 
+type groupAssignmentsResponse struct {
+	Group       string                    `json:"group"`
+	Topic       string                    `json:"topic"`
+	Found       bool                      `json:"found"`
+	Assignments []groupAssignmentResponse `json:"assignments"`
+}
+
 type groupAssignmentResponse struct {
 	MemberID string                         `json:"member_id"`
 	Topics   []groupTopicAssignmentResponse `json:"topics"`
@@ -207,6 +214,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/groups/remove-stale", s.groupRemoveStaleHandler)
 	mux.HandleFunc("/groups/rebalance", s.groupRebalanceHandler)
 	mux.HandleFunc("/groups/cleanup-and-rebalance", s.groupCleanupAndRebalanceHandler)
+	mux.HandleFunc("/groups/assignments", s.groupAssignmentsHandler)
 
 	return mux
 }
@@ -670,6 +678,43 @@ func (s *Server) groupCleanupAndRebalanceHandler(w http.ResponseWriter, r *http.
 		TimeoutMS:      req.TimeoutMS,
 		RemovedMembers: convertGroupMembers(removedMembers),
 		Assignments:    convertGroupAssignments(assignments),
+	})
+}
+
+func (s *Server) groupAssignmentsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	groupName := strings.TrimSpace(r.URL.Query().Get("group"))
+	if groupName == "" {
+		http.Error(w, "missing group", http.StatusBadRequest)
+		return
+	}
+
+	topicName := strings.TrimSpace(r.URL.Query().Get("topic"))
+	if topicName == "" {
+		http.Error(w, "missing topic", http.StatusBadRequest)
+		return
+	}
+
+	if s.assignmentStore == nil {
+		http.Error(w, "assignment store is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	assignments, found, err := s.assignmentStore.Get(groupName, topicName)
+	if err != nil {
+		http.Error(w, "failed to get assignments", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupAssignmentsResponse{
+		Group:       groupName,
+		Topic:       topicName,
+		Found:       found,
+		Assignments: convertGroupAssignments(assignments),
 	})
 }
 
