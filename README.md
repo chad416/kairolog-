@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, saved assignment lookup, saved assignment deletion, and server-wired file-backed assignment persistence.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, saved assignment lookup, saved assignment deletion, server-wired file-backed assignment persistence, and a file-backed group registry foundation.
 
 ## Current Features
 
@@ -66,6 +66,12 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Assignment persistence after `/groups/cleanup-and-rebalance`
 * Assignment deletion persistence after `DELETE /groups/assignments`
 * Saved assignment reload after server restart
+* Internal file-backed group registry foundation
+* File-backed group membership save, lookup, stale detection, stale removal, and load operations
+* File-backed `Join`, `Heartbeat`, `Leave`, `Members`, `State`, `StaleMembers`, and `RemoveStaleMembers`
+* JSONL-based group registry persistence
+* Group membership reload support after restart
+* LastSeen timestamp persistence foundation
 * Topic manager
 * Partition manager
 * Topic partitions wired to partition logs
@@ -98,9 +104,10 @@ server
 ```text
 internal/group
 → assignment engine
-→ membership registry
 → in-memory assignment store
 → file-backed assignment store
+→ in-memory membership registry
+→ file-backed membership registry
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -115,7 +122,7 @@ Consumer offsets are stored separately so a consumer group can remember how far 
 
 The group assignment engine distributes topic partitions across consumer group members in a deterministic and balanced way. The HTTP broker exposes direct assignment through `POST /groups/assign`.
 
-The group membership registry tracks members joining and leaving consumer groups. The HTTP broker exposes this through `POST /groups/join`, `POST /groups/leave`, and `GET /groups/members`.
+The in-memory group membership registry tracks members joining and leaving consumer groups. The HTTP broker exposes this through `POST /groups/join`, `POST /groups/leave`, and `GET /groups/members`.
 
 The group registry tracks `LastSeen` timestamps for members. A member receives a timestamp when it joins, and the heartbeat endpoint updates that timestamp when the member is seen again.
 
@@ -133,6 +140,8 @@ The saved assignment delete endpoint removes the saved assignment state for a gr
 
 The server now wires `AssignmentFileStore` as its default assignment store. Assignment state is saved to disk at `data/group_assignments.log` and loaded again when the server starts.
 
+The new `RegistryFileStore` exists inside `internal/group`. It can persist group membership and `LastSeen` timestamps to disk, but it is not wired into the HTTP server yet.
+
 ## Storage Layout
 
 KairoLog stores data under the `data` directory.
@@ -143,6 +152,7 @@ Example:
 data/
 ├── consumer_offsets.log
 ├── group_assignments.log
+├── group_registry.log
 └── orders/
     └── partition-0/
         ├── 00000000000000000000.log
@@ -159,7 +169,9 @@ The consumer offset file stores committed offsets for consumer groups.
 
 The group assignment file stores latest assignment state for group/topic pairs.
 
-Current group membership and heartbeat state are still in-memory only. Assignment state and consumer offsets are persisted.
+The group registry file can store group membership and `LastSeen` heartbeat state. This file-backed registry is implemented and tested, but it is not wired into server startup yet.
+
+Current server assignment state and consumer offsets are persisted. Current server group membership and heartbeat state are still in-memory until `RegistryFileStore` is wired into the server.
 
 ## API
 
@@ -580,6 +592,8 @@ Example response:
 }
 ```
 
+Currently, this endpoint uses the server’s in-memory group registry. File-backed registry support exists internally, but it is not wired into this endpoint yet.
+
 ### Leave Consumer Group
 
 ```http
@@ -602,6 +616,8 @@ Example response:
   "status": "left"
 }
 ```
+
+Currently, this endpoint uses the server’s in-memory group registry. File-backed registry support exists internally, but it is not wired into this endpoint yet.
 
 ### Record Consumer Group Heartbeat
 
@@ -628,6 +644,8 @@ Example response:
 
 The heartbeat endpoint records that a group member was recently seen. Internally, it updates the member’s `LastSeen` timestamp. If the member does not already exist in the group, the heartbeat creates the member entry.
 
+Currently, this endpoint uses the server’s in-memory group registry. File-backed registry support exists internally, but it is not wired into this endpoint yet.
+
 ### List Consumer Group Members
 
 ```http
@@ -651,6 +669,8 @@ Example response:
 ```
 
 The members endpoint currently returns member IDs only. `LastSeen` is tracked internally but is not exposed in this response yet.
+
+Currently, this endpoint uses the server’s in-memory group registry. File-backed registry support exists internally, but it is not wired into this endpoint yet.
 
 ### List Stale Consumer Group Members
 
@@ -725,7 +745,7 @@ The endpoint currently returns removed member IDs only. `LastSeen` is still trac
 
 If the group does not exist, the endpoint returns an empty `removed_members` array.
 
-This endpoint removes stale members from the in-memory group registry. It does not trigger automatic partition reassignment or rebalancing.
+This endpoint removes stale members from the group registry. It does not trigger automatic partition reassignment or rebalancing.
 
 ## Consumer Group Assignment
 
@@ -803,8 +823,9 @@ DELETE /groups/assignments?group=analytics-workers&topic=orders
 Current rebalance limits:
 
 ```text
-group membership is still in-memory
-heartbeat state is still in-memory
+server group membership is still in-memory
+server heartbeat state is still in-memory
+file-backed group registry exists but is not wired into server yet
 stale members are not removed inside /groups/rebalance
 offsets are not committed during rebalance
 background rebalance is not triggered
@@ -870,8 +891,9 @@ DELETE /groups/assignments?group=analytics-workers&topic=orders
 Current cleanup-and-rebalance limits:
 
 ```text
-group membership is still in-memory
-heartbeat state is still in-memory
+server group membership is still in-memory
+server heartbeat state is still in-memory
+file-backed group registry exists but is not wired into server yet
 offsets are not committed
 LastSeen is not exposed in HTTP responses
 cleanup runs only when the endpoint is called
@@ -970,6 +992,99 @@ The HTTP server now uses the file-backed assignment store by default at:
 data/group_assignments.log
 ```
 
+## In-Memory Group Registry
+
+The in-memory group registry tracks consumer group membership and heartbeat state during the current process lifetime.
+
+Internal API:
+
+```text
+NewRegistry()
+Join(group, memberID)
+Heartbeat(group, memberID, now)
+Leave(group, memberID)
+Members(group)
+State(group)
+StaleMembers(group, now, timeout)
+RemoveStaleMembers(group, now, timeout)
+```
+
+Registry behavior:
+
+```text
+Join → adds member and sets LastSeen for new members
+Heartbeat → updates LastSeen and creates missing member
+Leave → removes member
+Members → returns sorted group members
+State → returns group name and sorted members
+StaleMembers → returns stale members without removing them
+RemoveStaleMembers → removes stale members and returns removed members
+```
+
+The HTTP server currently uses this in-memory registry.
+
+## File-Backed Group Registry
+
+The file-backed group registry persists group membership and `LastSeen` heartbeat state to disk.
+
+Internal API:
+
+```text
+NewRegistryFileStore(path)
+Join(group, memberID)
+Heartbeat(group, memberID, now)
+Leave(group, memberID)
+Members(group)
+State(group)
+StaleMembers(group, now, timeout)
+RemoveStaleMembers(group, now, timeout)
+Load()
+```
+
+File-backed registry behavior:
+
+```text
+Join → adds member and persists registry state
+Heartbeat → updates LastSeen and persists registry state
+Leave → removes member and persists registry state
+Members → returns sorted group members
+State → returns group name and sorted members
+StaleMembers → returns stale members without mutating state
+RemoveStaleMembers → removes stale members and persists registry state
+Load → restores group/member/LastSeen state from disk
+```
+
+The file-backed registry uses a simple JSON Lines format.
+
+Example record:
+
+```json
+{
+  "group": "analytics-workers",
+  "member_id": "member-a",
+  "last_seen": "2026-04-30T12:00:00Z"
+}
+```
+
+The file-backed registry is concurrency-safe and uses an internal `sync.RWMutex`.
+
+Parent directories are created automatically.
+
+A missing registry file is treated as empty state.
+
+Records are persisted deterministically by sorted group and sorted member ID.
+
+Current file-backed registry limits:
+
+```text
+implemented and tested inside internal/group
+not wired into the HTTP server yet
+does not persist assignments
+does not commit offsets
+does not trigger rebalance by itself
+does not expose LastSeen through HTTP responses yet
+```
+
 ## Server Assignment Store Wiring
 
 The server now depends on an internal assignment store interface instead of a concrete in-memory assignment store.
@@ -1016,14 +1131,12 @@ server starts
 → saved assignment state becomes queryable again
 ```
 
-Current server assignment persistence limits:
+Current server registry persistence status:
 
 ```text
-group membership is not persisted yet
-heartbeat state is not persisted yet
-topic metadata persistence is still limited to the current topic manager behavior
-there is no automatic background rebalance
-there is no automatic background cleanup loop
+RegistryFileStore exists internally
+server still uses in-memory Registry
+next block should wire RegistryFileStore into server
 ```
 
 ## Consumer Group Membership
@@ -1052,12 +1165,13 @@ latest assignments can be stored internally by group/topic
 latest saved assignments can be read through HTTP
 latest saved assignments can be deleted through HTTP
 saved assignments can survive server restart
+file-backed group registry can persist membership internally
 duplicate joins are idempotent
 leaving a missing member is idempotent
 heartbeat for a missing member creates the member
 ```
 
-Membership is currently in-memory only. It is not persisted yet.
+Server membership is currently in-memory only. File-backed membership persistence exists internally but is not wired into server startup yet.
 
 ## Heartbeat Tracking
 
@@ -1081,7 +1195,7 @@ Leave(group, memberID)
 
 Heartbeat tracking is implemented inside the group registry and exposed through `POST /groups/heartbeat`.
 
-Heartbeat tracking does not run automatic background cleanup yet.
+File-backed heartbeat persistence exists in `RegistryFileStore`, but the HTTP server still uses the in-memory registry until the next wiring step.
 
 ## Stale Member Detection
 
@@ -1151,7 +1265,7 @@ remaining: member-b
 
 Stale member removal is implemented inside the group registry and exposed through `POST /groups/remove-stale`.
 
-Stale member removal does not persist group state or trigger background rebalancing.
+The file-backed registry can persist stale-member removal internally, but the server has not been wired to use it yet.
 
 ## Running Tests
 
@@ -1216,10 +1330,15 @@ Completed core areas:
 * Assignment file load/reload support
 * Assignment persistence tests
 * Server restart persistence tests for assignment state
+* Internal file-backed group registry
+* File-backed group membership persistence tests
+* File-backed heartbeat persistence tests
+* File-backed stale-member removal persistence tests
 
 Still planned:
 
-* Persist group membership and heartbeat state
+* Wire file-backed group registry into the HTTP server
+* Persist server group membership and heartbeat state
 * Background stale-member cleanup loop
 * Stronger crash recovery beyond missing-index rebuild
 * CLI client
