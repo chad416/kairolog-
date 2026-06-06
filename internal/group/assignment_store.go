@@ -2,6 +2,7 @@ package group
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -65,6 +66,18 @@ func (s *AssignmentStore) Get(group string, topic string) ([]Assignment, bool, e
 	return copyAssignments(assignments), true, nil
 }
 
+func (s *AssignmentStore) Topics(group string) ([]string, error) {
+	group, err := validateGroup(group)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return sortedAssignmentTopics(s.assignments[group]), nil
+}
+
 func (s *AssignmentStore) Delete(group string, topic string) error {
 	group, topic, err := validateAssignmentKey(group, topic)
 	if err != nil {
@@ -112,6 +125,20 @@ func validateAssignmentKey(group string, topic string) (string, string, error) {
 	}
 
 	return group, topic, nil
+}
+
+func sortedAssignmentTopics(groupAssignments map[string][]Assignment) []string {
+	topics := make([]string, 0, len(groupAssignments))
+	for topic, assignments := range groupAssignments {
+		if len(assignments) == 0 {
+			continue
+		}
+
+		topics = append(topics, topic)
+	}
+
+	sort.Strings(topics)
+	return topics
 }
 
 func copyAssignments(assignments []Assignment) []Assignment {

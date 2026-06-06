@@ -157,6 +157,170 @@ func TestAssignmentFileStoreSeparateTopicsInSameGroupAreIsolated(t *testing.T) {
 	}
 }
 
+func TestAssignmentFileStoreTopicsReturnsEmptySliceWhenStoreIsEmpty(t *testing.T) {
+	store := newTestAssignmentFileStore(t)
+
+	topics := mustAssignmentFileStoreTopics(t, store, "analytics-workers")
+	if len(topics) != 0 {
+		t.Fatalf("expected no topics, got %v", topics)
+	}
+}
+
+func TestAssignmentFileStoreTopicsReturnsSortedTopicNamesForGroup(t *testing.T) {
+	store := newTestAssignmentFileStore(t)
+
+	if err := store.Save("analytics-workers", "payments", samplePaymentAssignments()); err != nil {
+		t.Fatalf("failed to save payment assignments: %v", err)
+	}
+	if err := store.Save("analytics-workers", "orders", sampleAssignments()); err != nil {
+		t.Fatalf("failed to save order assignments: %v", err)
+	}
+
+	topics := mustAssignmentFileStoreTopics(t, store, "analytics-workers")
+	expected := []string{"orders", "payments"}
+	if !reflect.DeepEqual(topics, expected) {
+		t.Fatalf("expected %v, got %v", expected, topics)
+	}
+}
+
+func TestAssignmentFileStoreTopicsReturnsOnlyTopicsForRequestedGroup(t *testing.T) {
+	store := newTestAssignmentFileStore(t)
+
+	if err := store.Save("analytics-workers", "orders", sampleAssignments()); err != nil {
+		t.Fatalf("failed to save analytics assignments: %v", err)
+	}
+	if err := store.Save("billing-workers", "payments", samplePaymentAssignments()); err != nil {
+		t.Fatalf("failed to save billing assignments: %v", err)
+	}
+
+	topics := mustAssignmentFileStoreTopics(t, store, "analytics-workers")
+	expected := []string{"orders"}
+	if !reflect.DeepEqual(topics, expected) {
+		t.Fatalf("expected %v, got %v", expected, topics)
+	}
+}
+
+func TestAssignmentFileStoreTopicsExcludesDeletedGroupTopicAssignment(t *testing.T) {
+	store := newTestAssignmentFileStore(t)
+
+	if err := store.Save("analytics-workers", "orders", sampleAssignments()); err != nil {
+		t.Fatalf("failed to save order assignments: %v", err)
+	}
+	if err := store.Save("analytics-workers", "payments", samplePaymentAssignments()); err != nil {
+		t.Fatalf("failed to save payment assignments: %v", err)
+	}
+	if err := store.Delete("analytics-workers", "orders"); err != nil {
+		t.Fatalf("failed to delete order assignments: %v", err)
+	}
+
+	topics := mustAssignmentFileStoreTopics(t, store, "analytics-workers")
+	expected := []string{"payments"}
+	if !reflect.DeepEqual(topics, expected) {
+		t.Fatalf("expected %v, got %v", expected, topics)
+	}
+}
+
+func TestAssignmentFileStoreTopicsReturnsEmptyAfterDeleteGroup(t *testing.T) {
+	store := newTestAssignmentFileStore(t)
+
+	if err := store.Save("analytics-workers", "orders", sampleAssignments()); err != nil {
+		t.Fatalf("failed to save order assignments: %v", err)
+	}
+	if err := store.Save("analytics-workers", "payments", samplePaymentAssignments()); err != nil {
+		t.Fatalf("failed to save payment assignments: %v", err)
+	}
+	if err := store.DeleteGroup("analytics-workers"); err != nil {
+		t.Fatalf("failed to delete group assignments: %v", err)
+	}
+
+	topics := mustAssignmentFileStoreTopics(t, store, "analytics-workers")
+	if len(topics) != 0 {
+		t.Fatalf("expected no topics, got %v", topics)
+	}
+}
+
+func TestAssignmentFileStoreTopicsPersistAcrossLoad(t *testing.T) {
+	path := assignmentFileStorePath(t)
+	store := newTestAssignmentFileStoreAt(t, path)
+
+	if err := store.Save("analytics-workers", "payments", samplePaymentAssignments()); err != nil {
+		t.Fatalf("failed to save payment assignments: %v", err)
+	}
+	if err := store.Save("analytics-workers", "orders", sampleAssignments()); err != nil {
+		t.Fatalf("failed to save order assignments: %v", err)
+	}
+
+	reopened := newTestAssignmentFileStoreAt(t, path)
+	if err := reopened.Load(); err != nil {
+		t.Fatalf("failed to load assignments: %v", err)
+	}
+
+	topics := mustAssignmentFileStoreTopics(t, reopened, "analytics-workers")
+	expected := []string{"orders", "payments"}
+	if !reflect.DeepEqual(topics, expected) {
+		t.Fatalf("expected %v, got %v", expected, topics)
+	}
+}
+
+func TestAssignmentFileStoreTopicsReflectDeleteAfterLoad(t *testing.T) {
+	path := assignmentFileStorePath(t)
+	store := newTestAssignmentFileStoreAt(t, path)
+
+	if err := store.Save("analytics-workers", "orders", sampleAssignments()); err != nil {
+		t.Fatalf("failed to save order assignments: %v", err)
+	}
+	if err := store.Save("analytics-workers", "payments", samplePaymentAssignments()); err != nil {
+		t.Fatalf("failed to save payment assignments: %v", err)
+	}
+	if err := store.Delete("analytics-workers", "orders"); err != nil {
+		t.Fatalf("failed to delete order assignments: %v", err)
+	}
+
+	reopened := newTestAssignmentFileStoreAt(t, path)
+	if err := reopened.Load(); err != nil {
+		t.Fatalf("failed to load assignments: %v", err)
+	}
+
+	topics := mustAssignmentFileStoreTopics(t, reopened, "analytics-workers")
+	expected := []string{"payments"}
+	if !reflect.DeepEqual(topics, expected) {
+		t.Fatalf("expected %v, got %v", expected, topics)
+	}
+}
+
+func TestAssignmentFileStoreTopicsReflectDeleteGroupAfterLoad(t *testing.T) {
+	path := assignmentFileStorePath(t)
+	store := newTestAssignmentFileStoreAt(t, path)
+
+	if err := store.Save("analytics-workers", "orders", sampleAssignments()); err != nil {
+		t.Fatalf("failed to save order assignments: %v", err)
+	}
+	if err := store.Save("analytics-workers", "payments", samplePaymentAssignments()); err != nil {
+		t.Fatalf("failed to save payment assignments: %v", err)
+	}
+	if err := store.DeleteGroup("analytics-workers"); err != nil {
+		t.Fatalf("failed to delete group assignments: %v", err)
+	}
+
+	reopened := newTestAssignmentFileStoreAt(t, path)
+	if err := reopened.Load(); err != nil {
+		t.Fatalf("failed to load assignments: %v", err)
+	}
+
+	topics := mustAssignmentFileStoreTopics(t, reopened, "analytics-workers")
+	if len(topics) != 0 {
+		t.Fatalf("expected no topics, got %v", topics)
+	}
+}
+
+func TestAssignmentFileStoreTopicsRejectsEmptyGroup(t *testing.T) {
+	store := newTestAssignmentFileStore(t)
+
+	if _, err := store.Topics(""); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
 func TestAssignmentFileStoreDeleteRemovesOneGroupTopicAssignment(t *testing.T) {
 	store := newTestAssignmentFileStore(t)
 
@@ -595,4 +759,15 @@ func orderedAssignments() []Assignment {
 			},
 		},
 	}
+}
+
+func mustAssignmentFileStoreTopics(t *testing.T, store *AssignmentFileStore, group string) []string {
+	t.Helper()
+
+	topics, err := store.Topics(group)
+	if err != nil {
+		t.Fatalf("failed to get assignment topics: %v", err)
+	}
+
+	return topics
 }

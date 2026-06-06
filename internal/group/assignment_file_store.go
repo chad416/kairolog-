@@ -87,6 +87,18 @@ func (s *AssignmentFileStore) Get(group string, topic string) ([]Assignment, boo
 	return copyAssignments(assignments), true, nil
 }
 
+func (s *AssignmentFileStore) Topics(group string) ([]string, error) {
+	group, err := validateGroup(group)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return sortedAssignmentTopics(s.assignments[group]), nil
+}
+
 func (s *AssignmentFileStore) Delete(group string, topic string) error {
 	group, topic, err := validateAssignmentKey(group, topic)
 	if err != nil {

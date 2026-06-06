@@ -133,6 +133,96 @@ func TestAssignmentStoreSeparateTopicsInSameGroupAreIsolated(t *testing.T) {
 	}
 }
 
+func TestAssignmentStoreTopicsReturnsEmptySliceWhenStoreIsEmpty(t *testing.T) {
+	store := NewAssignmentStore()
+
+	topics := mustAssignmentStoreTopics(t, store, "analytics-workers")
+	if len(topics) != 0 {
+		t.Fatalf("expected no topics, got %v", topics)
+	}
+}
+
+func TestAssignmentStoreTopicsReturnsSortedTopicNamesForGroup(t *testing.T) {
+	store := NewAssignmentStore()
+
+	if err := store.Save("analytics-workers", "payments", samplePaymentAssignments()); err != nil {
+		t.Fatalf("failed to save payment assignments: %v", err)
+	}
+	if err := store.Save("analytics-workers", "orders", sampleAssignments()); err != nil {
+		t.Fatalf("failed to save order assignments: %v", err)
+	}
+
+	topics := mustAssignmentStoreTopics(t, store, "analytics-workers")
+	expected := []string{"orders", "payments"}
+	if !reflect.DeepEqual(topics, expected) {
+		t.Fatalf("expected %v, got %v", expected, topics)
+	}
+}
+
+func TestAssignmentStoreTopicsReturnsOnlyTopicsForRequestedGroup(t *testing.T) {
+	store := NewAssignmentStore()
+
+	if err := store.Save("analytics-workers", "orders", sampleAssignments()); err != nil {
+		t.Fatalf("failed to save analytics assignments: %v", err)
+	}
+	if err := store.Save("billing-workers", "payments", samplePaymentAssignments()); err != nil {
+		t.Fatalf("failed to save billing assignments: %v", err)
+	}
+
+	topics := mustAssignmentStoreTopics(t, store, "analytics-workers")
+	expected := []string{"orders"}
+	if !reflect.DeepEqual(topics, expected) {
+		t.Fatalf("expected %v, got %v", expected, topics)
+	}
+}
+
+func TestAssignmentStoreTopicsExcludesDeletedGroupTopicAssignment(t *testing.T) {
+	store := NewAssignmentStore()
+
+	if err := store.Save("analytics-workers", "orders", sampleAssignments()); err != nil {
+		t.Fatalf("failed to save order assignments: %v", err)
+	}
+	if err := store.Save("analytics-workers", "payments", samplePaymentAssignments()); err != nil {
+		t.Fatalf("failed to save payment assignments: %v", err)
+	}
+	if err := store.Delete("analytics-workers", "orders"); err != nil {
+		t.Fatalf("failed to delete order assignments: %v", err)
+	}
+
+	topics := mustAssignmentStoreTopics(t, store, "analytics-workers")
+	expected := []string{"payments"}
+	if !reflect.DeepEqual(topics, expected) {
+		t.Fatalf("expected %v, got %v", expected, topics)
+	}
+}
+
+func TestAssignmentStoreTopicsReturnsEmptyAfterDeleteGroup(t *testing.T) {
+	store := NewAssignmentStore()
+
+	if err := store.Save("analytics-workers", "orders", sampleAssignments()); err != nil {
+		t.Fatalf("failed to save order assignments: %v", err)
+	}
+	if err := store.Save("analytics-workers", "payments", samplePaymentAssignments()); err != nil {
+		t.Fatalf("failed to save payment assignments: %v", err)
+	}
+	if err := store.DeleteGroup("analytics-workers"); err != nil {
+		t.Fatalf("failed to delete group assignments: %v", err)
+	}
+
+	topics := mustAssignmentStoreTopics(t, store, "analytics-workers")
+	if len(topics) != 0 {
+		t.Fatalf("expected no topics, got %v", topics)
+	}
+}
+
+func TestAssignmentStoreTopicsRejectsEmptyGroup(t *testing.T) {
+	store := NewAssignmentStore()
+
+	if _, err := store.Topics(""); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
 func TestAssignmentStoreDeleteRemovesOneGroupTopicAssignment(t *testing.T) {
 	store := NewAssignmentStore()
 
@@ -431,4 +521,15 @@ func samplePaymentAssignments() []Assignment {
 			},
 		},
 	}
+}
+
+func mustAssignmentStoreTopics(t *testing.T, store *AssignmentStore, group string) []string {
+	t.Helper()
+
+	topics, err := store.Topics(group)
+	if err != nil {
+		t.Fatalf("failed to get assignment topics: %v", err)
+	}
+
+	return topics
 }
