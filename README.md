@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, internal assignment state storage, and saved assignment lookup.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, internal assignment state storage, saved assignment lookup, and saved assignment deletion.
 
 ## Current Features
 
@@ -18,6 +18,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Consumer group rebalance endpoint (`POST /groups/rebalance`)
 * Consumer group cleanup-and-rebalance endpoint (`POST /groups/cleanup-and-rebalance`)
 * Consumer group saved assignment lookup endpoint (`GET /groups/assignments`)
+* Consumer group saved assignment delete endpoint (`DELETE /groups/assignments`)
 * Consumer group join endpoint (`POST /groups/join`)
 * Consumer group leave endpoint (`POST /groups/leave`)
 * Consumer group heartbeat endpoint (`POST /groups/heartbeat`)
@@ -58,6 +59,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Server-wired assignment storage after rebalance
 * Server-wired assignment storage after cleanup-and-rebalance
 * HTTP lookup for latest saved group/topic assignment state
+* HTTP deletion for latest saved group/topic assignment state
 * Topic manager
 * Partition manager
 * Topic partitions wired to partition logs
@@ -83,6 +85,7 @@ server
 → cleanup-and-rebalance flow
 → assignment store
 → saved assignment lookup
+→ saved assignment deletion
 ```
 
 Each topic contains one or more partitions. Each partition is backed by a partition log. The partition log writes records into append-only segment files and stores offset-to-byte-position mappings in matching index files.
@@ -110,6 +113,8 @@ The rebalance endpoint calculates topic partition assignments using the currentl
 The cleanup-and-rebalance endpoint removes stale members first, calculates fresh assignments for the remaining active members, then saves the latest assignment state into the internal assignment store.
 
 The saved assignment lookup endpoint reads the latest stored assignment state for a group/topic pair.
+
+The saved assignment delete endpoint removes the saved assignment state for a group/topic pair without deleting group membership, offsets, or topic data.
 
 ## Storage Layout
 
@@ -504,6 +509,28 @@ It returns `found: false` when no assignment has been saved for that group/topic
 
 This endpoint does not calculate a new assignment, remove stale members, commit offsets, or mutate stored state.
 
+### Delete Saved Consumer Group Assignments
+
+```http
+DELETE /groups/assignments?group=analytics-workers&topic=orders
+```
+
+Example response:
+
+```json
+{
+  "status": "deleted",
+  "group": "analytics-workers",
+  "topic": "orders"
+}
+```
+
+This endpoint deletes the saved assignment result for the requested group/topic pair.
+
+Deleting a missing assignment is idempotent and still returns `200 OK`.
+
+This endpoint does not delete group membership, consumer offsets, topic data, or all assignments for a group. It only removes the saved assignment state for the requested group/topic pair.
+
 ### Join Consumer Group
 
 ```http
@@ -735,6 +762,12 @@ The saved result can be read through:
 GET /groups/assignments?group=analytics-workers&topic=orders
 ```
 
+The saved result can be deleted through:
+
+```http
+DELETE /groups/assignments?group=analytics-workers&topic=orders
+```
+
 Current rebalance limits:
 
 ```text
@@ -788,6 +821,12 @@ The saved result can be read through:
 
 ```http
 GET /groups/assignments?group=analytics-workers&topic=orders
+```
+
+The saved result can be deleted through:
+
+```http
+DELETE /groups/assignments?group=analytics-workers&topic=orders
 ```
 
 Current cleanup-and-rebalance limits:
@@ -846,14 +885,14 @@ analytics-workers/orders
 → latest assignment result
 ```
 
-The HTTP server currently supports reading saved assignments through `GET /groups/assignments`.
+The HTTP server currently supports reading and deleting saved assignments through `/groups/assignments`.
 
 Current assignment store limits:
 
 ```text
 in-memory only
 not persisted to disk
-delete is internal only and not exposed through HTTP yet
+DeleteGroup is internal only and not exposed through HTTP yet
 does not commit offsets
 does not trigger rebalance by itself
 ```
@@ -882,6 +921,7 @@ registered active members can be rebalanced
 stale members can be removed and remaining members rebalanced in one request
 latest assignments can be stored internally by group/topic
 latest saved assignments can be read through HTTP
+latest saved assignments can be deleted through HTTP
 duplicate joins are idempotent
 leaving a missing member is idempotent
 heartbeat for a missing member creates the member
@@ -1029,10 +1069,10 @@ Completed core areas:
 * Server-wired assignment store saving after rebalance
 * Server-wired assignment store saving after cleanup-and-rebalance
 * Saved assignment lookup endpoint
+* Saved assignment delete endpoint
 
 Still planned:
 
-* Delete saved assignments through HTTP
 * Persist assignment state to disk
 * Persistent group membership and heartbeat state
 * Background stale-member cleanup loop
