@@ -2,11 +2,14 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -1668,6 +1671,189 @@ func TestGroupCleanupAndRebalanceAfterRestartUsesPersistedMembersAndLastSeen(t *
 	}
 }
 
+func TestCleanupStaleMembersOnceRemovesStaleMembersAcrossAllGroups(t *testing.T) {
+	registry := group.NewRegistry()
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", now.Add(-10*time.Minute))
+	recordRegistryHeartbeat(t, registry, "billing-workers", "member-b", now.Add(-10*time.Minute))
+	recordRegistryHeartbeat(t, registry, "billing-workers", "member-c", now.Add(-time.Minute))
+
+	if err := cleanupStaleMembersOnce(registry, now, 5*time.Minute); err != nil {
+		t.Fatalf("failed to clean stale members: %v", err)
+	}
+
+	analyticsMembers, err := registry.Members("analytics-workers")
+	if err != nil {
+		t.Fatalf("failed to get analytics members: %v", err)
+	}
+	if len(analyticsMembers) != 0 {
+		t.Fatalf("expected no analytics members, got %v", analyticsMembers)
+	}
+
+	billingMembers, err := registry.Members("billing-workers")
+	if err != nil {
+		t.Fatalf("failed to get billing members: %v", err)
+	}
+	expectedBillingMembers := []group.GroupMember{
+		{ID: "member-c", LastSeen: now.Add(-time.Minute)},
+	}
+	if !reflect.DeepEqual(billingMembers, expectedBillingMembers) {
+		t.Fatalf("expected %v, got %v", expectedBillingMembers, billingMembers)
+	}
+}
+
+func TestCleanupStaleMembersOnceKeepsActiveMembers(t *testing.T) {
+	registry := group.NewRegistry()
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", now.Add(-time.Minute))
+
+	if err := cleanupStaleMembersOnce(registry, now, 5*time.Minute); err != nil {
+		t.Fatalf("failed to clean stale members: %v", err)
+	}
+
+	members, err := registry.Members("analytics-workers")
+	if err != nil {
+		t.Fatalf("failed to get members: %v", err)
+	}
+	expected := []group.GroupMember{
+		{ID: "member-a", LastSeen: now.Add(-time.Minute)},
+	}
+	if !reflect.DeepEqual(members, expected) {
+		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestCleanupStaleMembersOnceRemovesGroupWhenAllMembersAreStale(t *testing.T) {
+	registry := group.NewRegistry()
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", now.Add(-10*time.Minute))
+
+	if err := cleanupStaleMembersOnce(registry, now, 5*time.Minute); err != nil {
+		t.Fatalf("failed to clean stale members: %v", err)
+	}
+
+	groups, err := registry.Groups()
+	if err != nil {
+		t.Fatalf("failed to get groups: %v", err)
+	}
+	if len(groups) != 0 {
+		t.Fatalf("expected no groups, got %v", groups)
+	}
+}
+
+func TestCleanupStaleMembersOnceHandlesEmptyGroupList(t *testing.T) {
+	registry := group.NewRegistry()
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+
+	if err := cleanupStaleMembersOnce(registry, now, 5*time.Minute); err != nil {
+		t.Fatalf("expected empty group cleanup to succeed, got %v", err)
+	}
+}
+
+func TestCleanupStaleMembersOnceRejectsInvalidInput(t *testing.T) {
+	registry := group.NewRegistry()
+	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name     string
+		registry groupRegistry
+		now      time.Time
+		timeout  time.Duration
+	}{
+		{name: "nil registry", registry: nil, now: now, timeout: 5 * time.Minute},
+		{name: "zero now", registry: registry, now: time.Time{}, timeout: 5 * time.Minute},
+		{name: "zero timeout", registry: registry, now: now, timeout: 0},
+		{name: "negative timeout", registry: registry, now: now, timeout: -time.Minute},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := cleanupStaleMembersOnce(tt.registry, tt.now, tt.timeout); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestCleanupStaleMembersOnceReturnsErrorWhenGroupsFails(t *testing.T) {
+	expectedErr := errors.New("groups failed")
+	registry := &fakeCleanupRegistry{groupsErr: expectedErr}
+
+	err := cleanupStaleMembersOnce(registry, time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC), 5*time.Minute)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("expected error %v, got %v", expectedErr, err)
+	}
+}
+
+func TestCleanupStaleMembersOnceReturnsErrorWhenRemoveStaleMembersFails(t *testing.T) {
+	expectedErr := errors.New("remove failed")
+	registry := &fakeCleanupRegistry{
+		groups:    []string{"analytics-workers"},
+		removeErr: expectedErr,
+	}
+
+	err := cleanupStaleMembersOnce(registry, time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC), 5*time.Minute)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("expected error %v, got %v", expectedErr, err)
+	}
+}
+
+func TestBackgroundStaleMemberCleanupRemovesStaleMembersAfterTick(t *testing.T) {
+	registry := group.NewRegistry()
+
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-10*time.Minute))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", time.Now().Add(-time.Second))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startStaleMemberCleanup(ctx, registry, 5*time.Millisecond, 5*time.Minute)
+
+	waitForCondition(t, time.Second, func() bool {
+		members, err := registry.Members("analytics-workers")
+		if err != nil {
+			return false
+		}
+
+		return len(members) == 1 && members[0].ID == "member-b"
+	})
+
+	members, err := registry.Members("analytics-workers")
+	if err != nil {
+		t.Fatalf("failed to get members: %v", err)
+	}
+	if len(members) != 1 || members[0].ID != "member-b" {
+		t.Fatalf("expected only active member-b to remain, got %v", members)
+	}
+}
+
+func TestBackgroundStaleMemberCleanupStopsWhenContextIsCancelled(t *testing.T) {
+	registry := &fakeCleanupRegistry{groups: []string{"analytics-workers"}}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	startStaleMemberCleanup(ctx, registry, 5*time.Millisecond, 5*time.Minute)
+	waitForCondition(t, time.Second, func() bool {
+		return registry.removeCallCount() > 0
+	})
+
+	cancel()
+	time.Sleep(25 * time.Millisecond)
+	callsAfterCancel := registry.removeCallCount()
+	time.Sleep(25 * time.Millisecond)
+
+	if got := registry.removeCallCount(); got != callsAfterCancel {
+		t.Fatalf("expected cleanup to stop at %d calls, got %d", callsAfterCancel, got)
+	}
+}
+
 func TestGroupJoin(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -2707,6 +2893,64 @@ func loadDefaultRegistryFileStore(t *testing.T) *group.RegistryFileStore {
 	return registryStore
 }
 
+type fakeCleanupRegistry struct {
+	mu          sync.Mutex
+	groups      []string
+	groupsErr   error
+	removeErr   error
+	removeCalls int
+}
+
+func (r *fakeCleanupRegistry) Groups() ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.groupsErr != nil {
+		return nil, r.groupsErr
+	}
+
+	return append([]string(nil), r.groups...), nil
+}
+
+func (r *fakeCleanupRegistry) Join(_ string, _ string) error {
+	return nil
+}
+
+func (r *fakeCleanupRegistry) Heartbeat(_ string, _ string, _ time.Time) error {
+	return nil
+}
+
+func (r *fakeCleanupRegistry) Leave(_ string, _ string) error {
+	return nil
+}
+
+func (r *fakeCleanupRegistry) Members(_ string) ([]group.GroupMember, error) {
+	return nil, nil
+}
+
+func (r *fakeCleanupRegistry) StaleMembers(_ string, _ time.Time, _ time.Duration) ([]group.GroupMember, error) {
+	return nil, nil
+}
+
+func (r *fakeCleanupRegistry) RemoveStaleMembers(_ string, _ time.Time, _ time.Duration) ([]group.GroupMember, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.removeCalls++
+	if r.removeErr != nil {
+		return nil, r.removeErr
+	}
+
+	return nil, nil
+}
+
+func (r *fakeCleanupRegistry) removeCallCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.removeCalls
+}
+
 func recordRegistryHeartbeat(t *testing.T, registry *group.Registry, groupName string, memberID string, lastSeen time.Time) {
 	t.Helper()
 
@@ -2750,6 +2994,20 @@ func decodeJSON(t *testing.T, recorder *httptest.ResponseRecorder, target interf
 	if err := json.NewDecoder(recorder.Body).Decode(target); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	t.Fatalf("condition was not met within %s", timeout)
 }
 
 func chdirTemp(t *testing.T) {

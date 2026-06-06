@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,8 @@ const defaultAddr = ":8080"
 const defaultOffsetStorePath = "data/consumer_offsets.log"
 const defaultAssignmentStorePath = "data/group_assignments.log"
 const defaultRegistryStorePath = "data/group_registry.log"
+const defaultStaleCleanupInterval = 1 * time.Minute
+const defaultStaleMemberTimeout = 5 * time.Minute
 
 type assignmentStore interface {
 	Save(group string, topic string, assignments []group.Assignment) error
@@ -26,6 +29,7 @@ type assignmentStore interface {
 }
 
 type groupRegistry interface {
+	Groups() ([]string, error)
 	Join(group string, memberID string) error
 	Heartbeat(group string, memberID string, now time.Time) error
 	Leave(group string, memberID string) error
@@ -190,28 +194,33 @@ type groupMemberResponse struct {
 }
 
 func New() (*http.Server, error) {
+	srv, _, err := newConfiguredServer()
+	return srv, err
+}
+
+func newConfiguredServer() (*http.Server, groupRegistry, error) {
 	offsetStore, err := consumer.NewOffsetStore(defaultOffsetStorePath)
 	if err != nil {
-		return nil, fmt.Errorf("create offset store: %w", err)
+		return nil, nil, fmt.Errorf("create offset store: %w", err)
 	}
 
 	assignmentFileStore, err := group.NewAssignmentFileStore(defaultAssignmentStorePath)
 	if err != nil {
-		return nil, fmt.Errorf("create assignment store: %w", err)
+		return nil, nil, fmt.Errorf("create assignment store: %w", err)
 	}
 	if err := assignmentFileStore.Load(); err != nil {
-		return nil, fmt.Errorf("load assignment store: %w", err)
+		return nil, nil, fmt.Errorf("load assignment store: %w", err)
 	}
 
 	registryStore, err := group.NewRegistryFileStore(defaultRegistryStorePath)
 	if err != nil {
-		return nil, fmt.Errorf("create registry store: %w", err)
+		return nil, nil, fmt.Errorf("create registry store: %w", err)
 	}
 	if err := registryStore.Load(); err != nil {
-		return nil, fmt.Errorf("load registry store: %w", err)
+		return nil, nil, fmt.Errorf("load registry store: %w", err)
 	}
 
-	return newServer(topic.NewManager(), offsetStore, assignmentFileStore, registryStore), nil
+	return newServer(topic.NewManager(), offsetStore, assignmentFileStore, registryStore), registryStore, nil
 }
 
 func newServer(topicManager *topic.Manager, offsetStore *consumer.OffsetStore, assignmentStore assignmentStore, registry groupRegistry) *http.Server {
@@ -252,16 +261,66 @@ func (s *Server) routes() http.Handler {
 }
 
 func Start() error {
-	srv, err := New()
+	srv, registry, err := newConfiguredServer()
 	if err != nil {
 		return err
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv.RegisterOnShutdown(cancel)
+	startStaleMemberCleanup(ctx, registry, defaultStaleCleanupInterval, defaultStaleMemberTimeout)
 
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("start broker HTTP server: %w", err)
 	}
 
 	return nil
+}
+
+func cleanupStaleMembersOnce(registry groupRegistry, now time.Time, timeout time.Duration) error {
+	if registry == nil {
+		return fmt.Errorf("group registry cannot be nil")
+	}
+	if now.IsZero() {
+		return fmt.Errorf("now time cannot be zero")
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("timeout must be positive")
+	}
+
+	groups, err := registry.Groups()
+	if err != nil {
+		return fmt.Errorf("list groups: %w", err)
+	}
+
+	for _, groupName := range groups {
+		if _, err := registry.RemoveStaleMembers(groupName, now, timeout); err != nil {
+			return fmt.Errorf("remove stale members for group %q: %w", groupName, err)
+		}
+	}
+
+	return nil
+}
+
+func startStaleMemberCleanup(ctx context.Context, registry groupRegistry, interval time.Duration, timeout time.Duration) {
+	if ctx == nil || registry == nil || interval <= 0 || timeout <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				_ = cleanupStaleMembersOnce(registry, now, timeout)
+			}
+		}
+	}()
 }
 
 func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
