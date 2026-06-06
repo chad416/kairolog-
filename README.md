@@ -2,7 +2,7 @@
 
 KairoLog is a Kafka-inspired distributed commit log project written in Go.
 
-The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, saved assignment lookup, saved assignment deletion, server-wired file-backed assignment persistence, server-wired file-backed group registry persistence, group listing support, assignment topic listing support, and background stale-member cleanup.
+The current focus is the single-node broker and storage foundation: topics, partitions, append-only logs, segment files, index files, offset-based fetching, segment rotation, basic crash recovery, consumer offset commits, consumer group assignment, consumer group membership, heartbeat tracking, stale member detection, stale member removal, group rebalance calculation, cleanup-and-rebalance flow, saved assignment lookup, saved assignment deletion, server-wired file-backed assignment persistence, server-wired file-backed group registry persistence, group listing support, assignment topic listing support, background stale-member cleanup, and automatic assignment rebalance after background stale cleanup.
 
 ## Current Features
 
@@ -26,6 +26,8 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Stale group members endpoint (`GET /groups/stale`)
 * Stale group member removal endpoint (`POST /groups/remove-stale`)
 * Background stale-member cleanup loop
+* Automatic saved-assignment rebalance after background stale cleanup
+* Automatic saved-assignment deletion when all group members are stale
 * In-memory log component
 * File-based storage component
 * Offset-aware records
@@ -56,6 +58,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * JSONL-based assignment state persistence
 * Assignment persistence after `/groups/rebalance`
 * Assignment persistence after `/groups/cleanup-and-rebalance`
+* Assignment persistence after background stale cleanup and rebalance
 * Assignment deletion persistence after `DELETE /groups/assignments`
 * Saved assignment reload after server restart
 * Group registry abstraction inside the server
@@ -77,6 +80,7 @@ The current focus is the single-node broker and storage foundation: topics, part
 * Rebalance support using persisted group members after restart
 * Cleanup-and-rebalance support using persisted members and `LastSeen` after restart
 * Automatic stale-member cleanup using registered group discovery
+* Automatic rebalance using saved assignment topic discovery
 * Automatic parent directory creation for persistent state files
 * Topic manager
 * Partition manager
@@ -102,10 +106,12 @@ server
 → stale member detection
 → manual stale member removal
 → background stale member cleanup
+→ automatic saved-assignment rebalance
 → group rebalance calculation
 → cleanup-and-rebalance flow
 → assignment store interface
 → file-backed assignment store
+→ assignment topic listing support
 → saved assignment lookup
 → saved assignment deletion
 ```
@@ -141,13 +147,17 @@ The group registry tracks `LastSeen` timestamps for members. A member receives a
 
 The group registry can list known group names internally through `Groups()`. This is used by the background stale-member cleanup loop to discover all consumer groups.
 
-The assignment store can list saved topics for a consumer group through `Topics(group)`. This is the foundation for automatic rebalance after background stale-member cleanup, because the server must know which saved group/topic assignments need recalculation.
+The assignment store can list saved topics for a consumer group through `Topics(group)`. This is used by the background cleanup-and-rebalance logic to discover which saved group/topic assignments need recalculation after stale members are removed.
 
 The group registry can detect stale members by comparing each member’s `LastSeen` timestamp against a timeout window. The HTTP broker exposes detection through `GET /groups/stale`.
 
 The group registry can remove stale members manually through `POST /groups/remove-stale`.
 
-The server also runs a background stale-member cleanup loop from the production `Start()` path. This loop periodically discovers all groups and removes stale members automatically.
+The server also runs a background stale-member cleanup loop from the production `Start()` path. This loop periodically discovers all groups, removes stale members automatically, and then updates saved assignment state for affected groups.
+
+When background cleanup removes stale members from a group, the server checks saved topics for that group. For each saved topic that still exists in the topic manager, it recalculates assignments using the remaining active group members and saves the updated assignment state.
+
+If all members in a group are removed as stale, the server deletes saved assignments for that group’s saved topics. This prevents saved assignment state from pointing only to dead members.
 
 The rebalance endpoint calculates topic partition assignments using the currently registered group members, then saves the latest assignment state into the server’s file-backed assignment store.
 
@@ -451,7 +461,7 @@ registered group members
 
 Because the server uses the file-backed registry, rebalance can use persisted group members after server restart.
 
-This endpoint does not commit offsets, remove stale members, or trigger background rebalancing.
+This endpoint does not commit offsets or remove stale members.
 
 ### Cleanup and Rebalance Consumer Group
 
@@ -515,7 +525,7 @@ Because the server uses the file-backed registry, cleanup-and-rebalance can use 
 
 If all members are stale and removed, the endpoint returns `400 Bad Request` because there are no remaining active members to receive assignments.
 
-This endpoint does not commit offsets, expose `LastSeen`, or run as the background cleanup mechanism. It is a manual cleanup-and-rebalance request.
+This endpoint does not commit offsets or expose `LastSeen`.
 
 ### Get Saved Consumer Group Assignments
 
@@ -801,7 +811,7 @@ now - LastSeen > timeout
 
 This endpoint removes stale members from the file-backed group registry and persists the updated registry state to disk.
 
-This endpoint does not trigger automatic partition reassignment or rebalancing.
+This endpoint does not trigger automatic partition reassignment or rebalancing. Automatic rebalance happens only inside the background cleanup loop and the explicit cleanup-and-rebalance endpoint.
 
 ## Consumer Group Assignment
 
@@ -880,7 +890,6 @@ Current rebalance limits:
 
 ```text
 stale members are not removed inside /groups/rebalance
-background stale cleanup does not trigger rebalance yet
 offsets are not committed during rebalance
 ```
 
@@ -953,8 +962,6 @@ Current cleanup-and-rebalance limits:
 offsets are not committed
 LastSeen is not exposed in HTTP responses
 cleanup-and-rebalance runs only when the endpoint is called
-background cleanup removes stale members only
-background cleanup does not calculate new assignments yet
 ```
 
 ## In-Memory Assignment Store
@@ -1070,27 +1077,9 @@ works after AssignmentFileStore.Load()
 rejects empty group
 ```
 
-This is mainly a foundation for the next planned feature:
+This is used by automatic rebalance after background stale-member cleanup.
 
-```text
-automatic rebalance after background stale-member cleanup
-```
-
-The future automatic rebalance flow needs this because stale cleanup only knows the group. To recalculate assignments, the server also needs to know which topics that group has saved assignments for.
-
-Planned flow:
-
-```text
-background cleanup tick
-→ registry.Groups()
-→ for each group:
-   → registry.RemoveStaleMembers(group, now, timeout)
-   → if members were removed:
-      → assignmentStore.Topics(group)
-      → for each saved topic:
-         → recalculate assignments for remaining active members
-         → save updated assignment state
-```
+The automatic background flow needs this because stale cleanup discovers groups first. To recalculate saved assignments, the server also needs to know which topics each affected group has saved assignment state for.
 
 ## In-Memory Group Registry
 
@@ -1187,7 +1176,6 @@ Current file-backed registry limits:
 ```text
 does not expose LastSeen through HTTP responses yet
 does not expose Groups through HTTP yet
-does not trigger rebalance by itself
 does not commit offsets
 ```
 
@@ -1221,16 +1209,18 @@ every interval
 → registry.RemoveStaleMembers(group, now, timeout)
 ```
 
-## Background Stale-Member Cleanup
+## Background Stale-Member Cleanup and Automatic Rebalance
 
-The server has a background stale-member cleanup loop.
+The server has a background stale-member cleanup and rebalance loop.
 
 Purpose:
 
 ```text
 periodically discover all consumer groups
 remove stale members automatically
-persist the cleanup result through RegistryFileStore
+persist the registry cleanup result
+update saved assignment state for affected groups
+delete saved assignment state when all members are gone
 ```
 
 Default values:
@@ -1240,23 +1230,36 @@ defaultStaleCleanupInterval = 1 minute
 defaultStaleMemberTimeout = 5 minutes
 ```
 
-One cleanup pass:
+One cleanup-and-rebalance pass:
 
 ```text
-cleanupStaleMembersOnce(registry, now, timeout)
-→ validate registry, now, and timeout
+cleanupStaleMembersAndRebalanceOnce(...)
+→ validate registry, assignment store, topic manager, assigner, now, and timeout
 → groups = registry.Groups()
 → for each group:
-   → registry.RemoveStaleMembers(group, now, timeout)
+   → removedMembers = registry.RemoveStaleMembers(group, now, timeout)
+   → if no members were removed:
+      → skip assignment work
+   → if members were removed:
+      → topics = assignmentStore.Topics(group)
+      → activeMembers = registry.Members(group)
+      → if no active members remain:
+         → delete saved assignments for each saved topic
+      → if active members remain:
+         → for each saved topic:
+            → check topic exists in topic manager
+            → recalculate assignments
+            → save updated assignment state
 ```
 
 Background loop:
 
 ```text
-startStaleMemberCleanup(ctx, registry, interval, timeout)
+startStaleMemberCleanup(...)
 → create ticker
 → on each tick:
-   → run cleanupStaleMembersOnce(...)
+   → run cleanupStaleMembersAndRebalanceOnce(...)
+→ ignore cleanup errors and continue running
 → stop when context is cancelled
 ```
 
@@ -1267,7 +1270,7 @@ Start()
 → create configured server
 → create cancellable context
 → register cancellation on server shutdown
-→ start background stale-member cleanup
+→ start background stale-member cleanup and rebalance
 → run ListenAndServe
 ```
 
@@ -1281,15 +1284,42 @@ New()
 
 This prevents tests that call `New()` from leaking cleanup goroutines.
 
-Current background cleanup limits:
+Automatic rebalance behavior:
 
 ```text
-removes stale members only
-does not trigger rebalance automatically
-does not modify assignment state
+stale members removed
+→ saved topics discovered through assignmentStore.Topics(group)
+→ remaining active members loaded through registry.Members(group)
+→ assignments recalculated with group.Assigner
+→ updated assignments saved through assignmentStore.Save(...)
+```
+
+If all members are removed:
+
+```text
+stale members removed
+→ no active members remain
+→ saved assignments for the affected group/topics are deleted
+```
+
+If a saved assignment references a topic that is not currently loaded in the topic manager:
+
+```text
+topic missing
+→ assignment is skipped
+→ assignment state is not deleted
+```
+
+This is intentional because full topic metadata persistence is not implemented yet.
+
+Current background cleanup and rebalance limits:
+
+```text
 does not commit offsets
 does not expose new HTTP endpoints
 does not expose LastSeen in HTTP responses
+does not expose internal group/topic listing over HTTP
+does not coordinate across multiple brokers
 ```
 
 ## Server Persistent State Wiring
@@ -1311,7 +1341,7 @@ Production server startup behavior:
 ```text
 Start()
 → build configured server
-→ start background stale-member cleanup loop
+→ start background stale-member cleanup and rebalance loop
 → run HTTP server
 ```
 
@@ -1348,9 +1378,11 @@ GET /groups/stale
 POST /groups/remove-stale
 → persist stale-member deletion
 
-background cleanup loop
+background cleanup and rebalance loop
 → automatically remove stale members
 → persist registry cleanup state
+→ recalculate saved assignments for affected groups
+→ persist updated assignment state
 ```
 
 Restart behavior:
@@ -1362,7 +1394,7 @@ server starts
 → saved assignment state becomes queryable again
 → group membership becomes queryable again
 → LastSeen timestamps become available for stale-member logic
-→ background stale cleanup can continue from persisted registry state
+→ background stale cleanup and rebalance can continue from persisted registry and assignment state
 ```
 
 ## Consumer Group Membership
@@ -1388,7 +1420,9 @@ saved topics for a group can be listed internally
 stale members can be detected
 stale members can be removed manually
 stale members can be removed automatically in the background
-registered active members can be rebalanced
+saved assignments can be rebalanced automatically after background cleanup
+saved assignments can be deleted automatically when all members are stale
+registered active members can be rebalanced manually
 stale members can be removed and remaining members rebalanced in one request
 latest assignments can be stored internally by group/topic
 latest saved assignments can be read through HTTP
@@ -1496,7 +1530,7 @@ Stale member removal is exposed manually through `POST /groups/remove-stale`.
 
 Stale member removal also runs automatically through the background cleanup loop.
 
-Automatic stale member removal does not trigger background rebalancing yet.
+Automatic stale member removal can trigger saved assignment rebalance for affected groups.
 
 ## Running Tests
 
@@ -1566,8 +1600,11 @@ Completed core areas:
 * Registry group listing support
 * File-backed group listing support after load/restart
 * Background stale-member cleanup loop
-* Deterministic one-pass stale cleanup helper
+* Automatic saved-assignment rebalance after background stale cleanup
+* Automatic saved-assignment deletion when all group members are stale
+* Deterministic one-pass stale cleanup and rebalance helper
 * Background cleanup lifecycle tests
+* Background rebalance tests
 * File-backed group membership persistence tests
 * File-backed heartbeat persistence tests
 * File-backed stale-member removal persistence tests
@@ -1575,7 +1612,6 @@ Completed core areas:
 
 Still planned:
 
-* Automatic rebalance after background stale cleanup
 * Stronger crash recovery beyond missing-index rebuild
 * CLI client
 * Docker Compose demo
