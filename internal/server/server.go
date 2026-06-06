@@ -121,6 +121,12 @@ type groupAssignmentsResponse struct {
 	Assignments []groupAssignmentResponse `json:"assignments"`
 }
 
+type groupAssignmentDeleteResponse struct {
+	Status string `json:"status"`
+	Group  string `json:"group"`
+	Topic  string `json:"topic"`
+}
+
 type groupAssignmentResponse struct {
 	MemberID string                         `json:"member_id"`
 	Topics   []groupTopicAssignmentResponse `json:"topics"`
@@ -682,11 +688,17 @@ func (s *Server) groupCleanupAndRebalanceHandler(w http.ResponseWriter, r *http.
 }
 
 func (s *Server) groupAssignmentsHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
+		s.getGroupAssignmentsHandler(w, r)
+	case http.MethodDelete:
+		s.deleteGroupAssignmentsHandler(w, r)
+	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
 	}
+}
 
+func (s *Server) getGroupAssignmentsHandler(w http.ResponseWriter, r *http.Request) {
 	groupName := strings.TrimSpace(r.URL.Query().Get("group"))
 	if groupName == "" {
 		http.Error(w, "missing group", http.StatusBadRequest)
@@ -715,6 +727,36 @@ func (s *Server) groupAssignmentsHandler(w http.ResponseWriter, r *http.Request)
 		Topic:       topicName,
 		Found:       found,
 		Assignments: convertGroupAssignments(assignments),
+	})
+}
+
+func (s *Server) deleteGroupAssignmentsHandler(w http.ResponseWriter, r *http.Request) {
+	groupName := strings.TrimSpace(r.URL.Query().Get("group"))
+	if groupName == "" {
+		http.Error(w, "missing group", http.StatusBadRequest)
+		return
+	}
+
+	topicName := strings.TrimSpace(r.URL.Query().Get("topic"))
+	if topicName == "" {
+		http.Error(w, "missing topic", http.StatusBadRequest)
+		return
+	}
+
+	if s.assignmentStore == nil {
+		http.Error(w, "assignment store is not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.assignmentStore.Delete(groupName, topicName); err != nil {
+		http.Error(w, "failed to delete assignments", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, groupAssignmentDeleteResponse{
+		Status: "deleted",
+		Group:  groupName,
+		Topic:  topicName,
 	})
 }
 

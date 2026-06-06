@@ -1243,6 +1243,118 @@ func TestGroupAssignmentsWithNilAssignmentStoreReturnsInternalServerError(t *tes
 	}
 }
 
+func TestGroupAssignmentsDeleteRemovesSavedAssignmentsAfterRebalance(t *testing.T) {
+	srv := newTestServer(t)
+
+	createTopic(t, srv.Handler, "orders", 4)
+	joinGroup(t, srv.Handler, "analytics-workers", "member-a")
+	joinGroup(t, srv.Handler, "analytics-workers", "member-b")
+	rebalanceGroup(t, srv.Handler, "analytics-workers", "orders")
+
+	response := deleteGroupAssignments(t, srv.Handler, "analytics-workers", "orders")
+	expected := groupAssignmentDeleteResponse{
+		Status: "deleted",
+		Group:  "analytics-workers",
+		Topic:  "orders",
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+
+	assignments := getGroupAssignments(t, srv.Handler, "analytics-workers", "orders")
+	expectedAssignments := groupAssignmentsResponse{
+		Group:       "analytics-workers",
+		Topic:       "orders",
+		Found:       false,
+		Assignments: []groupAssignmentResponse{},
+	}
+
+	if !reflect.DeepEqual(assignments, expectedAssignments) {
+		t.Fatalf("expected %v, got %v", expectedAssignments, assignments)
+	}
+}
+
+func TestGroupAssignmentsDeleteRemovesSavedAssignmentsAfterCleanupAndRebalance(t *testing.T) {
+	srv, registry := newTestServerWithRegistry(t)
+
+	createTopic(t, srv.Handler, "orders", 4)
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-a", time.Now().Add(-10*time.Minute))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-b", time.Now().Add(-time.Second))
+	recordRegistryHeartbeat(t, registry, "analytics-workers", "member-c", time.Now().Add(-time.Second))
+	cleanupAndRebalanceGroup(t, srv.Handler, "analytics-workers", "orders", 300000)
+
+	response := deleteGroupAssignments(t, srv.Handler, "analytics-workers", "orders")
+	expected := groupAssignmentDeleteResponse{
+		Status: "deleted",
+		Group:  "analytics-workers",
+		Topic:  "orders",
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+
+	assignments := getGroupAssignments(t, srv.Handler, "analytics-workers", "orders")
+	expectedAssignments := groupAssignmentsResponse{
+		Group:       "analytics-workers",
+		Topic:       "orders",
+		Found:       false,
+		Assignments: []groupAssignmentResponse{},
+	}
+
+	if !reflect.DeepEqual(assignments, expectedAssignments) {
+		t.Fatalf("expected %v, got %v", expectedAssignments, assignments)
+	}
+}
+
+func TestGroupAssignmentsDeleteMissingAssignmentReturnsOK(t *testing.T) {
+	srv := newTestServer(t)
+
+	response := deleteGroupAssignments(t, srv.Handler, "analytics-workers", "orders")
+	expected := groupAssignmentDeleteResponse{
+		Status: "deleted",
+		Group:  "analytics-workers",
+		Topic:  "orders",
+	}
+
+	if !reflect.DeepEqual(response, expected) {
+		t.Fatalf("expected %v, got %v", expected, response)
+	}
+}
+
+func TestGroupAssignmentsDeleteRejectsInvalidQuery(t *testing.T) {
+	srv := newTestServer(t)
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "missing group", path: "/groups/assignments?topic=orders"},
+		{name: "empty group", path: "/groups/assignments?group=&topic=orders"},
+		{name: "missing topic", path: "/groups/assignments?group=analytics-workers"},
+		{name: "empty topic", path: "/groups/assignments?group=analytics-workers&topic="},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := performRequest(srv.Handler, http.MethodDelete, tt.path, nil)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("expected status %d, got %d", http.StatusBadRequest, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestGroupAssignmentsDeleteWithNilAssignmentStoreReturnsInternalServerError(t *testing.T) {
+	srv := newTestServerWithNilAssignmentStore(t)
+
+	recorder := performRequest(srv.Handler, http.MethodDelete, "/groups/assignments?group=analytics-workers&topic=orders", nil)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("expected status %d, got %d", http.StatusInternalServerError, recorder.Code)
+	}
+}
+
 func TestGroupJoin(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -2208,6 +2320,20 @@ func getGroupAssignments(t *testing.T, handler http.Handler, groupName string, t
 	}
 
 	var response groupAssignmentsResponse
+	decodeJSON(t, recorder, &response)
+
+	return response
+}
+
+func deleteGroupAssignments(t *testing.T, handler http.Handler, groupName string, topicName string) groupAssignmentDeleteResponse {
+	t.Helper()
+
+	recorder := performRequest(handler, http.MethodDelete, "/groups/assignments?group="+groupName+"&topic="+topicName, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, recorder.Code)
+	}
+
+	var response groupAssignmentDeleteResponse
 	decodeJSON(t, recorder, &response)
 
 	return response
