@@ -108,6 +108,13 @@ func (r *Registry) Members(group string) ([]GroupMember, error) {
 	return sortedGroupMembers(r.groups[group]), nil
 }
 
+func (r *Registry) Groups() ([]string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return sortedGroupNames(r.groups), nil
+}
+
 func (r *Registry) State(group string) (GroupState, error) {
 	group, err := validateGroup(group)
 	if err != nil {
@@ -194,6 +201,20 @@ func sortedGroupMembers(memberSet map[string]time.Time) []GroupMember {
 	})
 
 	return members
+}
+
+func sortedGroupNames(groups map[string]map[string]time.Time) []string {
+	groupNames := make([]string, 0, len(groups))
+	for group, members := range groups {
+		if len(members) == 0 {
+			continue
+		}
+
+		groupNames = append(groupNames, group)
+	}
+
+	sort.Strings(groupNames)
+	return groupNames
 }
 
 func validateGroupMember(group string, memberID string) (string, string, error) {

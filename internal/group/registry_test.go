@@ -157,6 +157,96 @@ func TestRegistryMembersAreReturnedSorted(t *testing.T) {
 	}
 }
 
+func TestRegistryGroupsReturnsEmptySliceWhenEmpty(t *testing.T) {
+	registry := NewRegistry()
+
+	groups := mustGroups(t, registry)
+	if len(groups) != 0 {
+		t.Fatalf("expected no groups, got %v", groups)
+	}
+}
+
+func TestRegistryGroupsReturnsSortedGroupNames(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	if err := registry.Heartbeat("billing-workers", "member-b", now); err != nil {
+		t.Fatalf("failed to heartbeat billing group: %v", err)
+	}
+	if err := registry.Heartbeat("analytics-workers", "member-a", now); err != nil {
+		t.Fatalf("failed to heartbeat analytics group: %v", err)
+	}
+
+	groups := mustGroups(t, registry)
+	expected := []string{"analytics-workers", "billing-workers"}
+	if !reflect.DeepEqual(groups, expected) {
+		t.Fatalf("expected %v, got %v", expected, groups)
+	}
+}
+
+func TestRegistryGroupsExcludesGroupAfterAllMembersLeave(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	if err := registry.Heartbeat("analytics-workers", "member-a", now); err != nil {
+		t.Fatalf("failed to heartbeat analytics group: %v", err)
+	}
+	if err := registry.Heartbeat("billing-workers", "member-b", now); err != nil {
+		t.Fatalf("failed to heartbeat billing group: %v", err)
+	}
+	if err := registry.Leave("analytics-workers", "member-a"); err != nil {
+		t.Fatalf("failed to leave group: %v", err)
+	}
+
+	groups := mustGroups(t, registry)
+	expected := []string{"billing-workers"}
+	if !reflect.DeepEqual(groups, expected) {
+		t.Fatalf("expected %v, got %v", expected, groups)
+	}
+}
+
+func TestRegistryGroupsExcludesGroupAfterAllMembersAreRemovedAsStale(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	heartbeatMembers(t, registry, "analytics-workers", map[string]time.Time{
+		"member-a": now.Add(-6 * time.Minute),
+		"member-b": now.Add(-7 * time.Minute),
+	})
+	if err := registry.Heartbeat("billing-workers", "member-c", now.Add(-time.Minute)); err != nil {
+		t.Fatalf("failed to heartbeat billing group: %v", err)
+	}
+
+	mustRemoveStaleMembers(t, registry, "analytics-workers", now, 5*time.Minute)
+
+	groups := mustGroups(t, registry)
+	expected := []string{"billing-workers"}
+	if !reflect.DeepEqual(groups, expected) {
+		t.Fatalf("expected %v, got %v", expected, groups)
+	}
+}
+
+func TestRegistryGroupsKeepsSeparateGroupsIsolated(t *testing.T) {
+	registry := NewRegistry()
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+
+	if err := registry.Heartbeat("analytics-workers", "member-a", now); err != nil {
+		t.Fatalf("failed to heartbeat analytics group: %v", err)
+	}
+	if err := registry.Heartbeat("billing-workers", "member-b", now); err != nil {
+		t.Fatalf("failed to heartbeat billing group: %v", err)
+	}
+	if err := registry.Leave("analytics-workers", "missing-member"); err != nil {
+		t.Fatalf("expected leaving missing member to succeed: %v", err)
+	}
+
+	groups := mustGroups(t, registry)
+	expected := []string{"analytics-workers", "billing-workers"}
+	if !reflect.DeepEqual(groups, expected) {
+		t.Fatalf("expected %v, got %v", expected, groups)
+	}
+}
+
 func TestRegistrySeparateGroupsAreIsolated(t *testing.T) {
 	registry := NewRegistry()
 	analyticsSeen := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
@@ -591,6 +681,17 @@ func mustMembers(t *testing.T, registry *Registry, group string) []GroupMember {
 	}
 
 	return members
+}
+
+func mustGroups(t *testing.T, registry *Registry) []string {
+	t.Helper()
+
+	groups, err := registry.Groups()
+	if err != nil {
+		t.Fatalf("failed to get groups: %v", err)
+	}
+
+	return groups
 }
 
 func mustStaleMembers(t *testing.T, registry *Registry, group string, now time.Time, timeout time.Duration) []GroupMember {

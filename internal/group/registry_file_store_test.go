@@ -182,6 +182,75 @@ func TestRegistryFileStoreMembersReturnsSortedMembers(t *testing.T) {
 	}
 }
 
+func TestRegistryFileStoreGroupsReturnsEmptySliceWhenEmpty(t *testing.T) {
+	store := newTestRegistryFileStore(t)
+
+	groups := mustFileStoreGroups(t, store)
+	if len(groups) != 0 {
+		t.Fatalf("expected no groups, got %v", groups)
+	}
+}
+
+func TestRegistryFileStoreGroupsReturnsSortedGroupNames(t *testing.T) {
+	store := newTestRegistryFileStore(t)
+	now := registryFileStoreBaseTime()
+
+	if err := store.Heartbeat("billing-workers", "member-b", now); err != nil {
+		t.Fatalf("failed to heartbeat billing group: %v", err)
+	}
+	if err := store.Heartbeat("analytics-workers", "member-a", now); err != nil {
+		t.Fatalf("failed to heartbeat analytics group: %v", err)
+	}
+
+	groups := mustFileStoreGroups(t, store)
+	expected := []string{"analytics-workers", "billing-workers"}
+	if !reflect.DeepEqual(groups, expected) {
+		t.Fatalf("expected %v, got %v", expected, groups)
+	}
+}
+
+func TestRegistryFileStoreGroupsExcludesGroupAfterAllMembersLeave(t *testing.T) {
+	store := newTestRegistryFileStore(t)
+	now := registryFileStoreBaseTime()
+
+	if err := store.Heartbeat("analytics-workers", "member-a", now); err != nil {
+		t.Fatalf("failed to heartbeat analytics group: %v", err)
+	}
+	if err := store.Heartbeat("billing-workers", "member-b", now); err != nil {
+		t.Fatalf("failed to heartbeat billing group: %v", err)
+	}
+	if err := store.Leave("analytics-workers", "member-a"); err != nil {
+		t.Fatalf("failed to leave group: %v", err)
+	}
+
+	groups := mustFileStoreGroups(t, store)
+	expected := []string{"billing-workers"}
+	if !reflect.DeepEqual(groups, expected) {
+		t.Fatalf("expected %v, got %v", expected, groups)
+	}
+}
+
+func TestRegistryFileStoreGroupsExcludesGroupAfterAllMembersAreRemovedAsStale(t *testing.T) {
+	store := newTestRegistryFileStore(t)
+	now := registryFileStoreBaseTime()
+
+	heartbeatFileStoreMembers(t, store, "analytics-workers", map[string]time.Time{
+		"member-a": now.Add(-6 * time.Minute),
+		"member-b": now.Add(-7 * time.Minute),
+	})
+	if err := store.Heartbeat("billing-workers", "member-c", now.Add(-time.Minute)); err != nil {
+		t.Fatalf("failed to heartbeat billing group: %v", err)
+	}
+
+	mustFileStoreRemoveStaleMembers(t, store, "analytics-workers", now, 5*time.Minute)
+
+	groups := mustFileStoreGroups(t, store)
+	expected := []string{"billing-workers"}
+	if !reflect.DeepEqual(groups, expected) {
+		t.Fatalf("expected %v, got %v", expected, groups)
+	}
+}
+
 func TestRegistryFileStoreMembersForMissingGroupReturnsEmptySlice(t *testing.T) {
 	store := newTestRegistryFileStore(t)
 
@@ -238,6 +307,57 @@ func TestRegistryFileStoreSeparateGroupsAreIsolated(t *testing.T) {
 
 	if !reflect.DeepEqual(members, expected) {
 		t.Fatalf("expected %v, got %v", expected, members)
+	}
+}
+
+func TestRegistryFileStoreGroupsPersistAcrossLoad(t *testing.T) {
+	path := registryFileStorePath(t)
+	store := newTestRegistryFileStoreAt(t, path)
+	now := registryFileStoreBaseTime()
+
+	if err := store.Heartbeat("billing-workers", "member-b", now); err != nil {
+		t.Fatalf("failed to heartbeat billing group: %v", err)
+	}
+	if err := store.Heartbeat("analytics-workers", "member-a", now); err != nil {
+		t.Fatalf("failed to heartbeat analytics group: %v", err)
+	}
+
+	reopened := newTestRegistryFileStoreAt(t, path)
+	if err := reopened.Load(); err != nil {
+		t.Fatalf("failed to load registry: %v", err)
+	}
+
+	groups := mustFileStoreGroups(t, reopened)
+	expected := []string{"analytics-workers", "billing-workers"}
+	if !reflect.DeepEqual(groups, expected) {
+		t.Fatalf("expected %v, got %v", expected, groups)
+	}
+}
+
+func TestRegistryFileStoreGroupsReflectDeletionAfterLoad(t *testing.T) {
+	path := registryFileStorePath(t)
+	store := newTestRegistryFileStoreAt(t, path)
+	now := registryFileStoreBaseTime()
+
+	if err := store.Heartbeat("analytics-workers", "member-a", now); err != nil {
+		t.Fatalf("failed to heartbeat analytics group: %v", err)
+	}
+	if err := store.Heartbeat("billing-workers", "member-b", now); err != nil {
+		t.Fatalf("failed to heartbeat billing group: %v", err)
+	}
+	if err := store.Leave("analytics-workers", "member-a"); err != nil {
+		t.Fatalf("failed to leave group: %v", err)
+	}
+
+	reopened := newTestRegistryFileStoreAt(t, path)
+	if err := reopened.Load(); err != nil {
+		t.Fatalf("failed to load registry: %v", err)
+	}
+
+	groups := mustFileStoreGroups(t, reopened)
+	expected := []string{"billing-workers"}
+	if !reflect.DeepEqual(groups, expected) {
+		t.Fatalf("expected %v, got %v", expected, groups)
 	}
 }
 
@@ -722,6 +842,17 @@ func mustFileStoreMembers(t *testing.T, store *RegistryFileStore, group string) 
 	}
 
 	return members
+}
+
+func mustFileStoreGroups(t *testing.T, store *RegistryFileStore) []string {
+	t.Helper()
+
+	groups, err := store.Groups()
+	if err != nil {
+		t.Fatalf("failed to get groups: %v", err)
+	}
+
+	return groups
 }
 
 func mustFileStoreStaleMembers(t *testing.T, store *RegistryFileStore, group string, now time.Time, timeout time.Duration) []GroupMember {

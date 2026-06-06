@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -118,6 +117,13 @@ func (s *RegistryFileStore) Members(group string) ([]GroupMember, error) {
 	defer s.mu.RUnlock()
 
 	return sortedGroupMembers(s.groups[group]), nil
+}
+
+func (s *RegistryFileStore) Groups() ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return sortedGroupNames(s.groups), nil
 }
 
 func (s *RegistryFileStore) State(group string) (GroupState, error) {
@@ -269,11 +275,7 @@ func (s *RegistryFileStore) persistLocked() error {
 }
 
 func registryRecordsFromMap(groups map[string]map[string]time.Time) []registryFileRecord {
-	groupNames := make([]string, 0, len(groups))
-	for group := range groups {
-		groupNames = append(groupNames, group)
-	}
-	sort.Strings(groupNames)
+	groupNames := sortedGroupNames(groups)
 
 	records := make([]registryFileRecord, 0)
 	for _, group := range groupNames {
