@@ -212,6 +212,8 @@ group registry / heartbeat state → data/group_registry.log
 
 This demo uses PowerShell and assumes the broker is running locally on port `8080`.
 
+For repeatable results, run the demo from a clean `data/` directory or use fresh group names. Reusing old group names can show older persisted state from previous demo runs.
+
 ### 1. Start the broker
 
 From the project root:
@@ -382,7 +384,7 @@ The production background cleanup loop uses the default stale timeout of `5 minu
 Wait long enough for `member-a` to become stale under a short timeout:
 
 ```powershell
-Start-Sleep -Seconds 6
+Start-Sleep -Seconds 35
 ```
 
 Heartbeat only `member-b`:
@@ -393,12 +395,12 @@ Invoke-RestMethod -Method Post "$base/groups/heartbeat" `
   -Body '{"group":"analytics-workers","member_id":"member-b"}'
 ```
 
-Run cleanup-and-rebalance with a `5000 ms` timeout:
+Run cleanup-and-rebalance with a `30000 ms` timeout:
 
 ```powershell
 Invoke-RestMethod -Method Post "$base/groups/cleanup-and-rebalance" `
   -ContentType "application/json" `
-  -Body '{"group":"analytics-workers","topic":"orders","timeout_ms":5000}' |
+  -Body '{"group":"analytics-workers","topic":"orders","timeout_ms":30000}' |
   ConvertTo-Json -Depth 10
 ```
 
@@ -408,7 +410,7 @@ Expected result:
 {
   "group": "analytics-workers",
   "topic": "orders",
-  "timeout_ms": 5000,
+  "timeout_ms": 30000,
   "removed_members": [
     {
       "id": "member-a"
@@ -585,6 +587,8 @@ Invoke-RestMethod -Method Get "$base/offsets?group=analytics-workers&topic=order
 ```
 
 Expected: assignment state and consumer offset state should still be available because they are persisted under `data/`.
+
+Note: saved assignments can be automatically deleted by the background cleanup loop if every member in the group becomes stale. For a clean persistence check, restart and verify shortly after creating/rebalancing the group, or keep at least one member active with heartbeats.
 
 Note: topic metadata persistence is not fully implemented yet. If topic metadata is not restored after restart, topic-dependent operations may require recreating the topic first. Assignment and offset state still persist separately.
 
@@ -2012,3 +2016,4 @@ Still planned for the larger full master roadmap / skyscraper:
 ## Project Goal
 
 The goal is to build a sophisticated Kafka-inspired commit log system from scratch to demonstrate understanding of storage internals, broker design, distributed systems foundations, and fault-tolerant infrastructure.
+
