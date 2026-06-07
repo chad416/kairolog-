@@ -208,6 +208,386 @@ group assignments → data/group_assignments.log
 group registry / heartbeat state → data/group_registry.log
 ```
 
+## Manual Demo Flow
+
+This demo uses PowerShell and assumes the broker is running locally on port `8080`.
+
+### 1. Start the broker
+
+From the project root:
+
+```powershell
+go run ./cmd/kairolog-broker
+```
+
+Open a second PowerShell window for HTTP requests.
+
+Set the base URL:
+
+```powershell
+$base = "http://localhost:8080"
+```
+
+### 2. Check broker health
+
+```powershell
+Invoke-RestMethod -Method Get "$base/health"
+```
+
+Expected response:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+### 3. Create a topic with four partitions
+
+```powershell
+Invoke-RestMethod -Method Post "$base/topics" `
+  -ContentType "application/json" `
+  -Body '{"name":"orders","partitions":4}'
+```
+
+List topics:
+
+```powershell
+Invoke-RestMethod -Method Get "$base/topics"
+```
+
+Expected response:
+
+```json
+{
+  "topics": ["orders"]
+}
+```
+
+### 4. Join two consumer group members
+
+```powershell
+Invoke-RestMethod -Method Post "$base/groups/join" `
+  -ContentType "application/json" `
+  -Body '{"group":"analytics-workers","member_id":"member-a"}'
+```
+
+```powershell
+Invoke-RestMethod -Method Post "$base/groups/join" `
+  -ContentType "application/json" `
+  -Body '{"group":"analytics-workers","member_id":"member-b"}'
+```
+
+Verify group members:
+
+```powershell
+Invoke-RestMethod -Method Get "$base/groups/members?group=analytics-workers" |
+  ConvertTo-Json -Depth 10
+```
+
+Expected response:
+
+```json
+{
+  "group": "analytics-workers",
+  "members": [
+    {
+      "id": "member-a"
+    },
+    {
+      "id": "member-b"
+    }
+  ]
+}
+```
+
+### 5. Rebalance the group
+
+```powershell
+Invoke-RestMethod -Method Post "$base/groups/rebalance" `
+  -ContentType "application/json" `
+  -Body '{"group":"analytics-workers","topic":"orders"}' |
+  ConvertTo-Json -Depth 10
+```
+
+Expected assignment shape:
+
+```json
+{
+  "group": "analytics-workers",
+  "assignments": [
+    {
+      "member_id": "member-a",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [0, 1]
+        }
+      ]
+    },
+    {
+      "member_id": "member-b",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [2, 3]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 6. View saved assignments
+
+```powershell
+Invoke-RestMethod -Method Get "$base/groups/assignments?group=analytics-workers&topic=orders" |
+  ConvertTo-Json -Depth 10
+```
+
+Expected result:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders",
+  "found": true,
+  "assignments": [
+    {
+      "member_id": "member-a",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [0, 1]
+        }
+      ]
+    },
+    {
+      "member_id": "member-b",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [2, 3]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 7. Demonstrate stale cleanup and reassignment
+
+The production background cleanup loop uses the default stale timeout of `5 minutes`. For a quick manual demo, use the explicit cleanup-and-rebalance endpoint with a short timeout.
+
+Wait long enough for `member-a` to become stale under a short timeout:
+
+```powershell
+Start-Sleep -Seconds 6
+```
+
+Heartbeat only `member-b`:
+
+```powershell
+Invoke-RestMethod -Method Post "$base/groups/heartbeat" `
+  -ContentType "application/json" `
+  -Body '{"group":"analytics-workers","member_id":"member-b"}'
+```
+
+Run cleanup-and-rebalance with a `5000 ms` timeout:
+
+```powershell
+Invoke-RestMethod -Method Post "$base/groups/cleanup-and-rebalance" `
+  -ContentType "application/json" `
+  -Body '{"group":"analytics-workers","topic":"orders","timeout_ms":5000}' |
+  ConvertTo-Json -Depth 10
+```
+
+Expected result:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders",
+  "timeout_ms": 5000,
+  "removed_members": [
+    {
+      "id": "member-a"
+    }
+  ],
+  "assignments": [
+    {
+      "member_id": "member-b",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [0, 1, 2, 3]
+        }
+      ]
+    }
+  ]
+}
+```
+
+Verify saved assignments were updated:
+
+```powershell
+Invoke-RestMethod -Method Get "$base/groups/assignments?group=analytics-workers&topic=orders" |
+  ConvertTo-Json -Depth 10
+```
+
+Expected saved assignment:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders",
+  "found": true,
+  "assignments": [
+    {
+      "member_id": "member-b",
+      "topics": [
+        {
+          "topic": "orders",
+          "partitions": [0, 1, 2, 3]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 8. Produce records
+
+```powershell
+Invoke-RestMethod -Method Post "$base/produce" `
+  -ContentType "application/json" `
+  -Body '{"topic":"orders","partition":0,"message":"created order 123"}'
+```
+
+```powershell
+Invoke-RestMethod -Method Post "$base/produce" `
+  -ContentType "application/json" `
+  -Body '{"topic":"orders","partition":0,"message":"created order 456"}'
+```
+
+Expected shape:
+
+```json
+{
+  "status": "stored",
+  "offset": 0
+}
+```
+
+The second message should return offset `1`.
+
+### 9. Fetch records
+
+```powershell
+Invoke-RestMethod -Method Get "$base/fetch?topic=orders&partition=0&offset=0" |
+  ConvertTo-Json -Depth 10
+```
+
+Expected response:
+
+```json
+{
+  "records": [
+    {
+      "offset": 0,
+      "message": "created order 123"
+    },
+    {
+      "offset": 1,
+      "message": "created order 456"
+    }
+  ]
+}
+```
+
+Fetch from offset `1`:
+
+```powershell
+Invoke-RestMethod -Method Get "$base/fetch?topic=orders&partition=0&offset=1" |
+  ConvertTo-Json -Depth 10
+```
+
+Expected response:
+
+```json
+{
+  "records": [
+    {
+      "offset": 1,
+      "message": "created order 456"
+    }
+  ]
+}
+```
+
+### 10. Commit and read consumer offset
+
+Commit offset `2` for the consumer group:
+
+```powershell
+Invoke-RestMethod -Method Post "$base/offsets/commit" `
+  -ContentType "application/json" `
+  -Body '{"group":"analytics-workers","topic":"orders","partition":0,"offset":2}'
+```
+
+Expected response:
+
+```json
+{
+  "status": "committed"
+}
+```
+
+Read the committed offset:
+
+```powershell
+Invoke-RestMethod -Method Get "$base/offsets?group=analytics-workers&topic=orders&partition=0"
+```
+
+Expected response:
+
+```json
+{
+  "group": "analytics-workers",
+  "topic": "orders",
+  "partition": 0,
+  "offset": 2,
+  "found": true
+}
+```
+
+### 11. Stop and restart persistence check
+
+Stop the broker with `Ctrl + C`.
+
+Start it again:
+
+```powershell
+go run ./cmd/kairolog-broker
+```
+
+Check saved assignments:
+
+```powershell
+Invoke-RestMethod -Method Get "$base/groups/assignments?group=analytics-workers&topic=orders" |
+  ConvertTo-Json -Depth 10
+```
+
+Check committed offset:
+
+```powershell
+Invoke-RestMethod -Method Get "$base/offsets?group=analytics-workers&topic=orders&partition=0"
+```
+
+Expected: assignment state and consumer offset state should still be available because they are persisted under `data/`.
+
+Note: topic metadata persistence is not fully implemented yet. If topic metadata is not restored after restart, topic-dependent operations may require recreating the topic first. Assignment and offset state still persist separately.
+
 ## API
 
 ### Health Check
@@ -1609,16 +1989,25 @@ Completed core areas:
 * File-backed heartbeat persistence tests
 * File-backed stale-member removal persistence tests
 * Server restart persistence tests for group membership and heartbeat state
+* Manual demo flow for GitHub readers
 
-Still planned:
+Still planned for final polish of the strong single-node project:
+
+* Run the manual demo flow once from PowerShell
+* Confirm final README accuracy after demo
+* Run final `go test ./...`
+* Commit and push final documentation polish
+
+Still planned for the larger full master roadmap / skyscraper:
 
 * Stronger crash recovery beyond missing-index rebuild
+* Topic metadata persistence
 * CLI client
 * Docker Compose demo
 * Metrics and benchmarks
 * Multi-broker replication
 * Leader election / Raft-style coordination
-* Final documentation and demo polish
+* Final distributed-system-level polish
 
 ## Project Goal
 
